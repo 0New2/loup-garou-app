@@ -8,11 +8,11 @@
 ## 🎯 Priorité IMMÉDIATE (À faire maintenant)
 
 ### Setup initial du projet
-- [ ] Lire le GDD.md en entier
-- [ ] Lire la ROADMAP.md en entier
-- [ ] Créer un repo GitHub "loup-garou-app"
-- [ ] Uploader ces 3 fichiers (GDD, ROADMAP, TODO) sur le repo
-- [ ] Décider de la stack technique (voir section "Choix techniques" ci-dessous)
+- [x] Lire le GDD.md en entier
+- [x] Lire la ROADMAP.md en entier
+- [x] Créer un repo GitHub "loup-garou-app"
+- [x] Uploader ces 3 fichiers (GDD, ROADMAP, TODO) sur le repo
+- [x] Décider de la stack technique (voir section "Choix techniques" ci-dessous)
 
 **Temps estimé :** 2h
 
@@ -138,11 +138,11 @@
 ## 📋 SEMAINE 2 : Setup technique
 
 ### Tâche 5 : Installation & Configuration
-- [ ] Installer tous les outils nécessaires
-- [ ] Créer le projet (React Native / Flutter / Web)
+- [x] Installer tous les outils nécessaires
+- [x] Créer le projet (React Native / Flutter / Web)
 - [ ] Setup Firebase dans le projet
 - [ ] Tester la connexion Firebase
-- [ ] Créer la structure de dossiers du projet
+- [x] Créer la structure de dossiers du projet
 
 **Structure de dossiers recommandée :**
 ```
@@ -168,10 +168,10 @@ loup-garou-app/
 ### Tâche 6 : Premier écran de test
 **Objectif :** Afficher "Hello World" sur ton téléphone
 
-- [ ] Créer un écran basique
-- [ ] Lancer l'app sur ton téléphone
-- [ ] Modifier le texte et voir le changement en direct
-- [ ] Tester un bouton qui fait une action
+- [x] Créer un écran basique
+- [x] Lancer l'app sur ton téléphone
+- [x] Modifier le texte et voir le changement en direct
+- [x] Tester un bouton qui fait une action
 
 **Critère de succès :** Tu peux voir l'app tourner sur ton tel et interagir avec
 
