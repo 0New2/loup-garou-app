@@ -1,32 +1,21 @@
-import React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
-import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { createStackNavigator } from '@react-navigation/stack';
 
-import MenuPrincipal from './screens/MenuPrincipal';
-import CreerPartie from './screens/CreerPartie';
-import RejoindrePartie from './screens/RejoindrePartie';
+import MenuPrincipal from './src/screens/MenuPrincipal';
+import CreerPartie from './src/screens/CreerPartie';
+import RejoindrePartie from './src/screens/RejoindrePartie';
+import ConfigurationRoles from './src/screens/ConfigurationRoles';
 
-const Stack = createNativeStackNavigator();
+const Stack = createStackNavigator();
 
 export default function App() {
   return (
     <NavigationContainer>
-      <Stack.Navigator>
-        <Stack.Screen 
-          name="MenuPrincipal" 
-          component={MenuPrincipal}
-          options={{ headerShown: false }}
-        />
-        <Stack.Screen 
-          name="CreerPartie" 
-          component={CreerPartie}
-          options={{ headerShown: false }}
-        />
-        <Stack.Screen 
-          name="RejoindrePartie" 
-          component={RejoindrePartie}
-          options={{ headerShown: false }}
-        />
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="MenuPrincipal" component={MenuPrincipal} />
+        <Stack.Screen name="CreerPartie" component={CreerPartie} />
+        <Stack.Screen name="RejoindrePartie" component={RejoindrePartie} />
+        <Stack.Screen name="ConfigurationRoles" component={ConfigurationRoles} />
       </Stack.Navigator>
     </NavigationContainer>
   );

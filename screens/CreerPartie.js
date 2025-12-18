@@ -55,14 +55,24 @@ export default function CreerPartie({ navigation }) {
     });
   };
 
+  const ajouterBotTest = () => {
+  const botId = Date.now().toString();
+  const botRef = ref(database, `parties/${codePartie}/joueurs/${botId}`);
+  set(botRef, {
+    nom: `Bot ${Math.floor(Math.random() * 100)}`,
+    connecte: true,
+    joinedAt: Date.now()
+  });
+};
+
   // Lancer la partie
   const lancerPartie = () => {
-    if (joueurs.length < 4) {
-      alert('Il faut au moins 4 joueurs pour commencer !');
-      return;
-    }
-    alert('Lancement de la partie ! (En développement)');
-  };
+  if (joueurs.length < 1) {
+    alert('Il faut au moins 4 joueurs !');
+    return;
+  }
+  navigation.navigate('ConfigurationRoles', { codePartie, joueurs });
+};
 
   if (!partieCreee) {
     return (
@@ -123,16 +133,23 @@ export default function CreerPartie({ navigation }) {
       </View>
 
       <TouchableOpacity 
+  style={styles.boutonTest}
+  onPress={ajouterBotTest}
+>
+  <Text style={styles.boutonTexte}>+ Ajouter bot de test</Text>
+</TouchableOpacity>
+
+      <TouchableOpacity 
         style={[
           styles.boutonLancer,
-          joueurs.length < 4 && styles.boutonDesactive
+          joueurs.length < 1 && styles.boutonDesactive
         ]}
         onPress={lancerPartie}
-        disabled={joueurs.length < 4}
+        disabled={joueurs.length < 1}
       >
         <Text style={styles.boutonTexte}>
-          {joueurs.length < 4 
-            ? `Attendre des joueurs (min. 4)` 
+          {joueurs.length < 1 
+            ? `Attendre des joueurs (min. 1)` 
             : `Lancer la partie avec ${joueurs.length} joueurs`}
         </Text>
       </TouchableOpacity>
@@ -239,6 +256,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#2ecc71',
   },
+  boutonTest: {
+  backgroundColor: '#9b59b6',
+  padding: 15,
+  borderRadius: 10,
+  marginBottom: 10,
+},
   boutonLancer: {
     backgroundColor: '#2ecc71',
     borderRadius: 15,
