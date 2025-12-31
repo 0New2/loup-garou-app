@@ -64,10 +64,25 @@ export default function LobbyScreen({ navigation, route }) {
         setGameStatus(config.status);
         setMaxPlayers(config.maxPlayers || 15);
 
-        // Si la partie a commencé, naviguer vers l'écran approprié
-        if (config.status === 'playing') {
-          // TODO: Naviguer vers RoleRevealScreen ou GameScreen
-          console.log('La partie a commencé !');
+        // Si les rôles ont été distribués
+        // Le MJ navigue depuis RoleConfigScreen → GameMaster
+        // Les JOUEURS (non-MJ) naviguent vers RoleReveal
+        if (config.status === 'roles_distributed' && !initialIsMaster) {
+          if (__DEV__) addLog('Rôles distribués - Navigation vers RoleReveal (joueur)');
+          navigation.replace('RoleReveal', {
+            gameCode,
+            playerId: initialPlayerId
+          });
+        }
+
+        // Si la partie a commencé et qu'on est toujours dans le lobby
+        if (config.status === 'playing' && !initialIsMaster) {
+          // Les joueurs vont voir leur rôle s'ils arrivent en retard
+          if (__DEV__) addLog('Partie en cours - Navigation vers RoleReveal');
+          navigation.replace('RoleReveal', {
+            gameCode,
+            playerId: initialPlayerId
+          });
         }
       } else {
         // La partie n'existe plus
@@ -117,8 +132,7 @@ export default function LobbyScreen({ navigation, route }) {
   };
 
   const goToRoleConfig = () => {
-    // TODO: Naviguer vers RoleConfigScreen
-    navigation.navigate('RoleConfig', { gameCode, playerId });
+    navigation.navigate('RoleConfig', { gameCode, playerId: initialPlayerId });
   };
 
   const renderPlayer = ({ item, index }) => {
@@ -222,23 +236,34 @@ export default function LobbyScreen({ navigation, route }) {
         <View style={styles.actionsContainer}>
           {isMaster ? (
             <>
-              <TouchableOpacity
-                style={[
-                  styles.button,
-                  styles.primaryButton,
-                  players.length < 4 && styles.buttonDisabled
-                ]}
-                onPress={goToRoleConfig}
-                disabled={players.length < 4}
-                activeOpacity={0.8}
-              >
-                <Text style={styles.buttonText}>Configurer les rôles</Text>
-              </TouchableOpacity>
-              {players.length < 4 && (
-                <Text style={styles.warningText}>
-                  Minimum 4 joueurs requis pour lancer la partie
-                </Text>
-              )}
+              {/* Compteur de joueurs qui recevront un rôle (hors MJ) */}
+              {(() => {
+                const playersCount = players.filter(p => !p.isMaster).length;
+                const minPlayers = 3;
+                const canStart = playersCount >= minPlayers;
+
+                return (
+                  <>
+                    <TouchableOpacity
+                      style={[
+                        styles.button,
+                        styles.primaryButton,
+                        !canStart && styles.buttonDisabled
+                      ]}
+                      onPress={goToRoleConfig}
+                      disabled={!canStart}
+                      activeOpacity={0.8}
+                    >
+                      <Text style={styles.buttonText}>Configurer les rôles</Text>
+                    </TouchableOpacity>
+                    {!canStart && (
+                      <Text style={styles.warningText}>
+                        Minimum {minPlayers} joueurs requis (hors MJ) - Actuellement: {playersCount}
+                      </Text>
+                    )}
+                  </>
+                );
+              })()}
             </>
           ) : (
             <View style={styles.waitingContainer}>

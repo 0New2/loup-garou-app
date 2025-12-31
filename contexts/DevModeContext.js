@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const DevModeContext = createContext(null);
@@ -23,6 +23,22 @@ export function DevModeProvider({ children }) {
 
   // Logs d'événements
   const [eventLogs, setEventLogs] = useState([]);
+
+  // Référence de navigation pour les tests de révélation
+  const navigationRef = useRef(null);
+
+  // Options de test révélation
+  const [skipAnimationEnabled, setSkipAnimationEnabled] = useState(false);
+
+  // Stocker la référence de navigation
+  const setNavigation = useCallback((nav) => {
+    navigationRef.current = nav;
+  }, []);
+
+  // Récupérer la navigation
+  const getNavigation = useCallback(() => {
+    return navigationRef.current;
+  }, []);
 
   // Enregistrer le contexte de jeu
   const setGameContext = useCallback((gameCode, playerId, master) => {
@@ -80,6 +96,30 @@ export function DevModeProvider({ children }) {
     return `Bot${existingPlayers.length + 1}`;
   }, []);
 
+  // Toggle skip animation
+  const toggleSkipAnimation = useCallback(() => {
+    setSkipAnimationEnabled(prev => !prev);
+    addLog(`Skip animation: ${!skipAnimationEnabled ? 'ON' : 'OFF'}`);
+  }, [skipAnimationEnabled, addLog]);
+
+  // Tester la révélation d'un rôle spécifique
+  const testRoleReveal = useCallback((roleId, skipAnim = false) => {
+    const nav = navigationRef.current;
+    if (!nav) {
+      addLog('Erreur: Navigation non disponible');
+      return false;
+    }
+
+    addLog(`Test révélation: ${roleId} (skip: ${skipAnim})`);
+    nav.navigate('RoleReveal', {
+      gameCode: currentGameCode || 'TEST',
+      playerId: currentPlayerId || 'test_player',
+      simulatedRole: roleId,
+      skipAnimation: skipAnim || skipAnimationEnabled,
+    });
+    return true;
+  }, [currentGameCode, currentPlayerId, skipAnimationEnabled, addLog]);
+
   const value = {
     // État
     isDevModeEnabled,
@@ -89,6 +129,7 @@ export function DevModeProvider({ children }) {
     originalPlayerId,
     isMaster,
     eventLogs,
+    skipAnimationEnabled,
 
     // Actions
     setGameContext,
@@ -99,6 +140,10 @@ export function DevModeProvider({ children }) {
     addLog,
     clearLogs,
     getNextBotName,
+    setNavigation,
+    getNavigation,
+    toggleSkipAnimation,
+    testRoleReveal,
   };
 
   // Ne rendre le provider que si on est en mode dev
@@ -126,6 +171,7 @@ export function useDevMode() {
       originalPlayerId: null,
       isMaster: false,
       eventLogs: [],
+      skipAnimationEnabled: false,
       setGameContext: () => {},
       toggleDevPanel: () => {},
       setIsDevPanelVisible: () => {},
@@ -134,6 +180,10 @@ export function useDevMode() {
       addLog: () => {},
       clearLogs: () => {},
       getNextBotName: () => 'Bot',
+      setNavigation: () => {},
+      getNavigation: () => null,
+      toggleSkipAnimation: () => {},
+      testRoleReveal: () => false,
     };
   }
 
