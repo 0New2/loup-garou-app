@@ -12,6 +12,7 @@ import LobbyScreen from './screens/LobbyScreen';
 import RoleConfigScreen from './screens/RoleConfigScreen';
 import RoleRevealScreen from './screens/RoleRevealScreen';
 import GameMasterScreen from './screens/GameMasterScreen';
+import PlayerGameScreen from './screens/PlayerGameScreen';
 
 // Import du mode développeur
 import { DevModeProvider, useDevMode } from './contexts/DevModeContext';
@@ -82,6 +83,14 @@ function AppContent() {
             component={GameMasterScreen}
             options={{
               title: 'Maître du Jeu',
+              gestureEnabled: false
+            }}
+          />
+          <Stack.Screen
+            name="PlayerGame"
+            component={PlayerGameScreen}
+            options={{
+              title: 'Partie',
               gestureEnabled: false
             }}
           />

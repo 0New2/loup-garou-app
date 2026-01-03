@@ -146,16 +146,7 @@ export default function RoleRevealScreen({ navigation, route }) {
 
   // Continuer vers l'écran de jeu
   const continueToGame = () => {
-    // TODO: Créer PlayerGameScreen - pour l'instant retour au lobby
-    // navigation.replace('PlayerGame', { gameCode, playerId: initialPlayerId });
-
-    // Temporairement : attendre dans le lobby
-    navigation.replace('Lobby', {
-      gameCode,
-      playerId: initialPlayerId,
-      isMaster: false,
-      playerName: playerData?.name
-    });
+    navigation.replace('PlayerGame', { gameCode, playerId: initialPlayerId });
   };
 
   // Retour dev (bouton caché)

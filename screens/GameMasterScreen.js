@@ -14,6 +14,7 @@ import {
 import { ref, onValue, off, update, set, push } from 'firebase/database';
 import { database } from '../firebase';
 import { getRoleById, ROLES } from '../utils/roles';
+import { checkPresentRoles, getNextValidPhase, resolveNightActions, getLastNightVictims, getLovers } from '../utils/gameLogic';
 import { useDevMode } from '../contexts/DevModeContext';
 import PlayerCard from '../components/PlayerCard';
 import colors from '../constants/colors';
@@ -123,6 +124,9 @@ export default function GameMasterScreen({ navigation, route }) {
   const [gameState, setGameState] = useState(null);
   const [gameConfig, setGameConfig] = useState(null);
   const [actions, setActions] = useState([]);
+  const [currentNightActions, setCurrentNightActions] = useState([]);
+  const [presentRoles, setPresentRoles] = useState({});
+  const [lovers, setLovers] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isProcessing, setIsProcessing] = useState(false);
 
@@ -207,13 +211,116 @@ export default function GameMasterScreen({ navigation, route }) {
       }
     });
 
+    // Écouter les amoureux
+    const loversRef = ref(database, `games/${gameCode}/lovers`);
+    const unsubLovers = onValue(loversRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setLovers(snapshot.val());
+      } else {
+        setLovers(null);
+      }
+    });
+
     return () => {
       off(playersRef);
       off(stateRef);
       off(configRef);
       off(actionsRef);
+      off(loversRef);
     };
   }, [gameCode]);
+
+  // Vérifier les rôles présents quand les joueurs changent
+  useEffect(() => {
+    const checkRoles = async () => {
+      const roles = await checkPresentRoles(gameCode);
+      setPresentRoles(roles);
+    };
+    if (players.length > 0) {
+      checkRoles();
+    }
+  }, [players, gameCode]);
+
+  // Listener pour les actions de la nuit courante
+  useEffect(() => {
+    if (!gameState?.nightCount && gameState?.nightCount !== 0) return;
+
+    const nightKey = `night-${gameState.nightCount}`;
+    const currentNightRef = ref(database, `games/${gameCode}/actions/${nightKey}`);
+
+    const unsubCurrentNight = onValue(currentNightRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.val();
+        const formattedActions = [];
+
+        // Action de Cupidon (première nuit)
+        if (data.cupidAction === 'formed') {
+          formattedActions.push({
+            type: 'cupid',
+            icon: '💘',
+            message: `Cupidon a formé un couple : ${data.cupidLover1Name || '?'} ❤️ ${data.cupidLover2Name || '?'}`,
+            timestamp: data.cupidTimestamp || Date.now(),
+          });
+        }
+
+        // Action des loups
+        if (data.werewolfTarget) {
+          formattedActions.push({
+            type: 'werewolf',
+            icon: '🐺',
+            message: `Les loups ont choisi ${data.werewolfTargetName || 'une victime'}`,
+            timestamp: data.werewolfTimestamp || Date.now(),
+          });
+        }
+
+        // Action de la voyante
+        if (data.seerTarget) {
+          formattedActions.push({
+            type: 'seer',
+            icon: '🔮',
+            message: `La voyante a vu ${data.seerTargetName || 'un joueur'}`,
+            timestamp: data.seerTimestamp || Date.now(),
+          });
+        }
+
+        // Action de la sorcière - Potion de vie
+        if (data.witchSaved) {
+          formattedActions.push({
+            type: 'witch_life',
+            icon: '💚',
+            message: 'La sorcière a utilisé sa potion de vie',
+            timestamp: data.witchTimestamp || Date.now(),
+          });
+        }
+
+        // Action de la sorcière - Potion de mort
+        if (data.witchKillTarget) {
+          formattedActions.push({
+            type: 'witch_death',
+            icon: '💀',
+            message: `La sorcière a empoisonné ${data.witchKillTargetName || 'un joueur'}`,
+            timestamp: data.witchTimestamp || Date.now(),
+          });
+        }
+
+        // Action de la sorcière - Rien
+        if (data.witchAction === 'nothing') {
+          formattedActions.push({
+            type: 'witch_nothing',
+            icon: '🧪',
+            message: 'La sorcière n\'a rien fait',
+            timestamp: data.witchTimestamp || Date.now(),
+          });
+        }
+
+        setCurrentNightActions(formattedActions.sort((a, b) => a.timestamp - b.timestamp));
+      } else {
+        setCurrentNightActions([]);
+      }
+    });
+
+    return () => off(currentNightRef);
+  }, [gameCode, gameState?.nightCount]);
 
   // Gestion du timer local
   useEffect(() => {
@@ -268,23 +375,36 @@ export default function GameMasterScreen({ navigation, route }) {
 
   // ==================== ACTIONS ====================
 
-  // Passer à la phase suivante
+  // Passer à la phase suivante (avec skip automatique des rôles absents)
   const nextPhase = async () => {
-    const next = phaseInfo.next;
-    if (!next) {
+    if (currentPhase === 'finished') {
       Alert.alert('Fin de partie', 'La partie est terminée.');
       return;
     }
 
     setIsProcessing(true);
     try {
+      // Utiliser la nouvelle fonction qui skip automatiquement les phases des rôles absents
+      const next = getNextValidPhase(currentPhase, presentRoles, nightCount);
+
       const updates = {};
       updates[`games/${gameCode}/gameState/currentPhase`] = next;
       updates[`games/${gameCode}/gameState/lastPhaseChange`] = Date.now();
 
-      // Incrémenter le compteur de nuits si on recommence
-      if (next === 'night_start') {
+      // Incrémenter le compteur de nuits si on recommence une nouvelle nuit
+      if (next === 'night_start' && currentPhase !== 'role_reveal') {
         updates[`games/${gameCode}/gameState/nightCount`] = nightCount + 1;
+      }
+
+      // Résoudre les actions de la nuit quand on passe au jour
+      if (next === 'day_announcement' && nightCount >= 0) {
+        const victims = await resolveNightActions(gameCode, nightCount);
+        if (victims.length > 0) {
+          // Stocker les victimes pour l'annonce
+          updates[`games/${gameCode}/gameState/lastNightVictims`] = victims;
+        } else {
+          updates[`games/${gameCode}/gameState/lastNightVictims`] = null;
+        }
       }
 
       // Mettre à jour le statut si nécessaire
@@ -763,6 +883,19 @@ export default function GameMasterScreen({ navigation, route }) {
               <Text style={styles.statLabel}>Nuit</Text>
             </View>
           </View>
+
+          {/* Affichage des amoureux si formés */}
+          {lovers && (
+            <View style={styles.loversCard}>
+              <Text style={styles.loversIcon}>💘</Text>
+              <View style={styles.loversInfo}>
+                <Text style={styles.loversTitle}>Amoureux</Text>
+                <Text style={styles.loversNames}>
+                  {lovers.player1Name} ❤️ {lovers.player2Name}
+                </Text>
+              </View>
+            </View>
+          )}
         </View>
 
         {/* ==================== CONTRÔLES DE PHASE ==================== */}
@@ -935,21 +1068,44 @@ export default function GameMasterScreen({ navigation, route }) {
 
         {/* ==================== LOG DES ACTIONS ==================== */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>📜 Actions de la nuit</Text>
+          <Text style={styles.sectionTitle}>📜 Actions de la nuit {nightCount}</Text>
 
           <View style={styles.logCard}>
-            {actions.length === 0 ? (
-              <Text style={styles.logEmpty}>Aucune action enregistrée</Text>
+            {currentNightActions.length === 0 ? (
+              <Text style={styles.logEmpty}>Aucune action enregistrée cette nuit</Text>
             ) : (
-              actions.slice(0, 10).map((action, index) => (
-                <View key={action.id || index} style={styles.logItem}>
-                  <Text style={styles.logTime}>
-                    {action.night?.replace('night-', 'N')}
-                  </Text>
+              currentNightActions.map((action, index) => (
+                <View key={`${action.type}-${index}`} style={styles.logItem}>
+                  <Text style={styles.logIcon}>{action.icon}</Text>
                   <Text style={styles.logMessage}>{action.message}</Text>
                 </View>
               ))
             )}
+          </View>
+
+          {/* Indicateur des rôles présents */}
+          <View style={styles.rolesPresent}>
+            <Text style={styles.rolesPresentTitle}>Rôles actifs cette nuit :</Text>
+            <View style={styles.rolesBadges}>
+              {presentRoles.hasCupid && nightCount === 0 && (
+                <View style={[styles.roleBadge, { backgroundColor: '#EC4899' }]}>
+                  <Text style={styles.roleBadgeText}>💘 Cupidon</Text>
+                </View>
+              )}
+              <View style={[styles.roleBadge, { backgroundColor: '#8B0000' }]}>
+                <Text style={styles.roleBadgeText}>🐺 Loups</Text>
+              </View>
+              {presentRoles.hasSeer && (
+                <View style={[styles.roleBadge, { backgroundColor: '#8B5CF6' }]}>
+                  <Text style={styles.roleBadgeText}>🔮 Voyante</Text>
+                </View>
+              )}
+              {presentRoles.hasWitch && (
+                <View style={[styles.roleBadge, { backgroundColor: '#059669' }]}>
+                  <Text style={styles.roleBadgeText}>🧪 Sorcière</Text>
+                </View>
+              )}
+            </View>
           </View>
         </View>
 
@@ -1117,6 +1273,35 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     fontSize: 11,
     marginTop: 2,
+  },
+
+  // Amoureux
+  loversCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(236, 72, 153, 0.2)',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: '#EC4899',
+  },
+  loversIcon: {
+    fontSize: 28,
+    marginRight: 12,
+  },
+  loversInfo: {
+    flex: 1,
+  },
+  loversTitle: {
+    color: '#EC4899',
+    fontSize: 12,
+    fontWeight: 'bold',
+    marginBottom: 2,
+  },
+  loversNames: {
+    color: colors.textPrimary,
+    fontSize: 14,
   },
 
   // Sections
@@ -1329,6 +1514,39 @@ const styles = StyleSheet.create({
     color: colors.textPrimary,
     fontSize: 13,
     flex: 1,
+  },
+  logIcon: {
+    fontSize: 18,
+    marginRight: 10,
+    width: 25,
+  },
+
+  // Rôles présents
+  rolesPresent: {
+    marginTop: 15,
+    paddingTop: 15,
+    borderTopWidth: 1,
+    borderTopColor: colors.backgroundSecondary,
+  },
+  rolesPresentTitle: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginBottom: 10,
+  },
+  rolesBadges: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  roleBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 15,
+  },
+  roleBadgeText: {
+    color: '#FFF',
+    fontSize: 11,
+    fontWeight: '600',
   },
 
   // Quick actions
