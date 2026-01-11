@@ -14,9 +14,24 @@ import {
 import { ref, onValue, off, update, set, push } from 'firebase/database';
 import { database } from '../firebase';
 import { getRoleById, ROLES } from '../utils/roles';
-import { checkPresentRoles, getNextValidPhase, resolveNightActions, getLastNightVictims, getLovers } from '../utils/gameLogic';
+import {
+  checkPresentRoles,
+  getNextValidPhase,
+  getValidPhasesForGame,
+  shouldSkipPhase,
+  resolveNightActions,
+  getLastNightVictims,
+  getLovers,
+  countVotes,
+  resolveVote,
+  clearVotes,
+  checkWinConditionFromFirebase,
+  endGameWithWinner,
+  handleLoversEffect
+} from '../utils/gameLogic';
 import { useDevMode } from '../contexts/DevModeContext';
 import PlayerCard from '../components/PlayerCard';
+import Timer from '../components/Timer';
 import colors from '../constants/colors';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -144,6 +159,14 @@ export default function GameMasterScreen({ navigation, route }) {
   const [showPlayerModal, setShowPlayerModal] = useState(false);
   const [selectedPlayer, setSelectedPlayer] = useState(null);
 
+  // États pour les votes
+  const [votes, setVotes] = useState({});
+  const [voteStats, setVoteStats] = useState({ voteCounts: {}, totalVotes: 0, hasTie: false, tiedPlayers: [] });
+  const [showTieModal, setShowTieModal] = useState(false);
+  const [lastVoteResult, setLastVoteResult] = useState(null);
+  const [showVictoryModal, setShowVictoryModal] = useState(false);
+  const [victoryResult, setVictoryResult] = useState(null);
+
   // Initialiser le contexte dev
   useEffect(() => {
     if (__DEV__) {
@@ -189,7 +212,17 @@ export default function GameMasterScreen({ navigation, route }) {
     });
 
     const unsubConfig = onValue(configRef, (snapshot) => {
-      setGameConfig(snapshot.exists() ? snapshot.val() : null);
+      if (snapshot.exists()) {
+        const config = snapshot.val();
+        setGameConfig(config);
+
+        // Si la partie est terminée par un autre moyen, naviguer vers EndGame
+        if (config.status === 'finished') {
+          navigation.replace('EndGame', { gameCode, playerId });
+        }
+      } else {
+        setGameConfig(null);
+      }
     });
 
     const unsubActions = onValue(actionsRef, (snapshot) => {
@@ -221,12 +254,27 @@ export default function GameMasterScreen({ navigation, route }) {
       }
     });
 
+    // Écouter les votes
+    const votesRef = ref(database, `games/${gameCode}/votes`);
+    const unsubVotes = onValue(votesRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const votesData = snapshot.val();
+        setVotes(votesData);
+        // Calculer les stats en temps réel
+        setVoteStats(countVotes(votesData));
+      } else {
+        setVotes({});
+        setVoteStats({ voteCounts: {}, totalVotes: 0, hasTie: false, tiedPlayers: [] });
+      }
+    });
+
     return () => {
       off(playersRef);
       off(stateRef);
       off(configRef);
       off(actionsRef);
       off(loversRef);
+      off(votesRef);
     };
   }, [gameCode]);
 
@@ -322,12 +370,14 @@ export default function GameMasterScreen({ navigation, route }) {
     return () => off(currentNightRef);
   }, [gameCode, gameState?.nightCount]);
 
-  // Gestion du timer local
+  // Gestion du timer local avec synchronisation Firebase temps reel
   useEffect(() => {
     if (isTimerRunning && timerValue !== null && timerValue > 0) {
       timerRef.current = setInterval(() => {
         setTimerValue((prev) => {
-          if (prev <= 1) {
+          const newValue = prev - 1;
+
+          if (newValue <= 0) {
             clearInterval(timerRef.current);
             setIsTimerRunning(false);
             // Synchroniser avec Firebase
@@ -335,13 +385,19 @@ export default function GameMasterScreen({ navigation, route }) {
               [`games/${gameCode}/gameState/timer`]: 0,
               [`games/${gameCode}/gameState/timerRunning`]: false,
             });
-            // Auto next phase si activé
+            // Auto next phase si active
             if (autoNextPhase) {
               setTimeout(() => nextPhase(), 1000);
             }
             return 0;
           }
-          return prev - 1;
+
+          // Synchroniser avec Firebase chaque seconde pour les joueurs
+          update(ref(database), {
+            [`games/${gameCode}/gameState/timer`]: newValue,
+          });
+
+          return newValue;
         });
       }, 1000);
     }
@@ -351,7 +407,7 @@ export default function GameMasterScreen({ navigation, route }) {
         clearInterval(timerRef.current);
       }
     };
-  }, [isTimerRunning, timerValue, autoNextPhase]);
+  }, [isTimerRunning, autoNextPhase]);
 
   // Joueurs sans le MJ
   const gamePlayers = players.filter(p => !p.isMaster);
@@ -372,6 +428,10 @@ export default function GameMasterScreen({ navigation, route }) {
   const currentPhase = gameState?.currentPhase || 'role_reveal';
   const phaseInfo = PHASES[currentPhase] || PHASES.role_reveal;
   const nightCount = gameState?.nightCount || 0;
+
+  // Calculer la vraie prochaine phase (en tenant compte des rôles absents)
+  const actualNextPhase = getNextValidPhase(currentPhase, presentRoles, nightCount);
+  const actualNextPhaseInfo = PHASES[actualNextPhase];
 
   // ==================== ACTIONS ====================
 
@@ -446,6 +506,108 @@ export default function GameMasterScreen({ navigation, route }) {
     }
   };
 
+  // ==================== VOTES ====================
+
+  // Résoudre le vote
+  const handleResolveVote = async (forcedWinnerId = null) => {
+    setIsProcessing(true);
+    try {
+      const result = await resolveVote(gameCode, votes, forcedWinnerId);
+
+      if (result.hasTie && !forcedWinnerId) {
+        // Égalité : afficher le modal pour que le MJ choisisse
+        setShowTieModal(true);
+        setIsProcessing(false);
+        return;
+      }
+
+      if (result.eliminated) {
+        const eliminatedPlayer = players.find(p => p.id === result.eliminated);
+        const eliminatedRole = getRoleById(eliminatedPlayer?.role);
+
+        // Stocker le résultat pour l'affichage
+        setLastVoteResult({
+          player: eliminatedPlayer,
+          role: eliminatedRole,
+          voteCounts: result.voteCounts,
+        });
+
+        // Log de l'action
+        await logAction(`⚖️ ${eliminatedPlayer?.name} éliminé par le vote (${result.maxVotes} votes)`);
+
+        // Passer à la phase result
+        await update(ref(database), {
+          [`games/${gameCode}/gameState/currentPhase`]: 'vote_result',
+          [`games/${gameCode}/gameState/lastPhaseChange`]: Date.now(),
+          [`games/${gameCode}/gameState/lastEliminatedId`]: result.eliminated,
+          [`games/${gameCode}/gameState/lastEliminatedName`]: eliminatedPlayer?.name,
+          [`games/${gameCode}/gameState/lastEliminatedRole`]: eliminatedPlayer?.role,
+        });
+
+        if (__DEV__) addLog(`Vote résolu: ${eliminatedPlayer?.name} éliminé`);
+      }
+
+      setShowTieModal(false);
+    } catch (error) {
+      console.error('Erreur résolution vote:', error);
+      Alert.alert('Erreur', 'Impossible de résoudre le vote.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Réinitialiser les votes pour une nouvelle phase
+  const handleClearVotes = async () => {
+    try {
+      await clearVotes(gameCode);
+      setVotes({});
+      setVoteStats({ voteCounts: {}, totalVotes: 0, hasTie: false, tiedPlayers: [] });
+      if (__DEV__) addLog('Votes réinitialisés');
+    } catch (error) {
+      Alert.alert('Erreur', 'Impossible de réinitialiser les votes.');
+    }
+  };
+
+  // ==================== VICTOIRE ====================
+
+  // Vérifier les conditions de victoire
+  const handleCheckVictory = async () => {
+    setIsProcessing(true);
+    try {
+      const result = await checkWinConditionFromFirebase(gameCode);
+
+      if (result) {
+        setVictoryResult(result);
+        setShowVictoryModal(true);
+      } else {
+        Alert.alert('Partie en cours', 'Aucune condition de victoire atteinte.\n\nLe jeu continue !');
+      }
+    } catch (error) {
+      Alert.alert('Erreur', 'Impossible de vérifier la victoire.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Confirmer la fin de partie avec un gagnant
+  const confirmVictory = async () => {
+    if (!victoryResult) return;
+
+    setIsProcessing(true);
+    try {
+      await endGameWithWinner(gameCode, victoryResult.winner, victoryResult.message);
+      await logAction(`🏆 Partie terminée: ${victoryResult.winner === 'village' ? 'Village' : 'Loups'} gagne!`);
+      setShowVictoryModal(false);
+
+      // Redirection vers l'écran de fin
+      navigation.replace('EndGame', { gameCode, playerId });
+    } catch (error) {
+      Alert.alert('Erreur', 'Impossible de terminer la partie.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   // Logger une action
   const logAction = async (message, type = 'system') => {
     try {
@@ -472,7 +634,9 @@ export default function GameMasterScreen({ navigation, route }) {
 
     await update(ref(database), {
       [`games/${gameCode}/gameState/timer`]: newValue,
+      [`games/${gameCode}/gameState/timerDuration`]: timerDuration,
       [`games/${gameCode}/gameState/timerRunning`]: true,
+      [`games/${gameCode}/gameState/timerStartedAt`]: Date.now(),
     });
   };
 
@@ -483,6 +647,7 @@ export default function GameMasterScreen({ navigation, route }) {
     }
 
     await update(ref(database), {
+      [`games/${gameCode}/gameState/timer`]: timerValue,
       [`games/${gameCode}/gameState/timerRunning`]: false,
     });
   };
@@ -496,17 +661,25 @@ export default function GameMasterScreen({ navigation, route }) {
 
     await update(ref(database), {
       [`games/${gameCode}/gameState/timer`]: timerDuration,
+      [`games/${gameCode}/gameState/timerDuration`]: timerDuration,
       [`games/${gameCode}/gameState/timerRunning`]: false,
     });
   };
 
-  const setTimerPreset = (value) => {
+  const setTimerPreset = async (value) => {
     setTimerDuration(value);
     setTimerValue(value);
     setIsTimerRunning(false);
     if (timerRef.current) {
       clearInterval(timerRef.current);
     }
+
+    // Synchroniser le preset avec Firebase pour les joueurs
+    await update(ref(database), {
+      [`games/${gameCode}/gameState/timer`]: value,
+      [`games/${gameCode}/gameState/timerDuration`]: value,
+      [`games/${gameCode}/gameState/timerRunning`]: false,
+    });
   };
 
   // Formater le temps
@@ -912,96 +1085,136 @@ export default function GameMasterScreen({ navigation, route }) {
             ) : (
               <>
                 <Text style={styles.nextPhaseButtonText}>PHASE SUIVANTE</Text>
-                <Text style={styles.nextPhaseArrow}>→ {PHASES[phaseInfo.next]?.name || 'Fin'}</Text>
+                <Text style={styles.nextPhaseArrow}>→ {actualNextPhaseInfo?.name || 'Fin'}</Text>
               </>
             )}
           </TouchableOpacity>
 
-          {/* Sélecteur de phases */}
+          {/* Sélecteur de phases (affiche uniquement les phases valides) */}
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
             style={styles.phasesScroll}
           >
-            {Object.entries(PHASES).map(([key, phase]) => (
-              <TouchableOpacity
-                key={key}
-                style={[
-                  styles.phaseChip,
-                  currentPhase === key && styles.phaseChipActive,
-                  { borderColor: phase.color }
-                ]}
-                onPress={() => forcePhase(key)}
-              >
-                <Text style={styles.phaseChipIcon}>{phase.icon}</Text>
-                <Text style={[
-                  styles.phaseChipText,
-                  currentPhase === key && { color: phase.color }
-                ]}>
-                  {phase.name.split(' ')[0]}
-                </Text>
-              </TouchableOpacity>
-            ))}
+            {Object.entries(PHASES)
+              .filter(([key]) => !shouldSkipPhase(key, presentRoles, nightCount))
+              .map(([key, phase]) => (
+                <TouchableOpacity
+                  key={key}
+                  style={[
+                    styles.phaseChip,
+                    currentPhase === key && styles.phaseChipActive,
+                    { borderColor: phase.color }
+                  ]}
+                  onPress={() => forcePhase(key)}
+                >
+                  <Text style={styles.phaseChipIcon}>{phase.icon}</Text>
+                  <Text style={[
+                    styles.phaseChipText,
+                    currentPhase === key && { color: phase.color }
+                  ]}>
+                    {phase.name.split(' ')[0]}
+                  </Text>
+                </TouchableOpacity>
+              ))}
           </ScrollView>
         </View>
 
         {/* ==================== TIMER ==================== */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>⏱️ Timer</Text>
+          <View style={styles.timerHeader}>
+            <Text style={styles.sectionTitle}>⏱️ Gestion du Timer</Text>
+            <View style={[
+              styles.timerStatusBadge,
+              isTimerRunning ? styles.timerStatusActive : styles.timerStatusPaused
+            ]}>
+              <Text style={styles.timerStatusText}>
+                {isTimerRunning ? '⚡ Actif' : '⏸️ En pause'}
+              </Text>
+            </View>
+          </View>
 
           <View style={styles.timerCard}>
-            <Text style={[
-              styles.timerDisplay,
-              timerValue !== null && timerValue <= 10 && styles.timerWarning
-            ]}>
-              {formatTime(timerValue || timerDuration)}
-            </Text>
-
-            <View style={styles.timerPresets}>
-              {TIMER_PRESETS.map(preset => (
-                <TouchableOpacity
-                  key={preset.label}
-                  style={[
-                    styles.timerPreset,
-                    timerDuration === preset.value && styles.timerPresetActive
-                  ]}
-                  onPress={() => setTimerPreset(preset.value)}
-                >
-                  <Text style={[
-                    styles.timerPresetText,
-                    timerDuration === preset.value && styles.timerPresetTextActive
-                  ]}>
-                    {preset.label}
-                  </Text>
-                </TouchableOpacity>
-              ))}
+            {/* Timer visuel circulaire */}
+            <View style={styles.timerVisualContainer}>
+              {timerDuration !== null ? (
+                <Timer
+                  duration={timerDuration}
+                  remainingTime={timerValue || timerDuration}
+                  isActive={isTimerRunning}
+                  isMaster={true}
+                  size="large"
+                  showLabel={true}
+                  onComplete={() => {
+                    if (autoNextPhase) {
+                      nextPhase();
+                    } else {
+                      Alert.alert('Timer terminé !', 'Le temps est écoulé. Passez à la phase suivante.');
+                    }
+                  }}
+                />
+              ) : (
+                <View style={styles.timerInfinite}>
+                  <Text style={styles.timerInfiniteIcon}>∞</Text>
+                  <Text style={styles.timerInfiniteText}>Timer désactivé</Text>
+                </View>
+              )}
             </View>
 
-            <View style={styles.timerControls}>
+            {/* Présets de durée */}
+            <View style={styles.timerPresetsContainer}>
+              <Text style={styles.timerPresetsLabel}>Durée :</Text>
+              <View style={styles.timerPresets}>
+                {TIMER_PRESETS.map(preset => (
+                  <TouchableOpacity
+                    key={preset.label}
+                    style={[
+                      styles.timerPreset,
+                      timerDuration === preset.value && styles.timerPresetActive
+                    ]}
+                    onPress={() => setTimerPreset(preset.value)}
+                  >
+                    <Text style={[
+                      styles.timerPresetText,
+                      timerDuration === preset.value && styles.timerPresetTextActive
+                    ]}>
+                      {preset.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+
+            {/* Contrôles du timer */}
+            <View style={styles.timerControlsRow}>
               {!isTimerRunning ? (
                 <TouchableOpacity
-                  style={[styles.timerButton, styles.startButton]}
+                  style={[styles.timerControlButton, styles.startButton]}
                   onPress={startTimer}
                   disabled={timerDuration === null}
                 >
-                  <Text style={styles.timerButtonText}>▶ START</Text>
+                  <Text style={styles.timerControlIcon}>▶️</Text>
+                  <Text style={styles.timerControlText}>START</Text>
                 </TouchableOpacity>
               ) : (
                 <TouchableOpacity
-                  style={[styles.timerButton, styles.pauseButton]}
+                  style={[styles.timerControlButton, styles.pauseButton]}
                   onPress={pauseTimer}
                 >
-                  <Text style={styles.timerButtonText}>⏸ PAUSE</Text>
+                  <Text style={styles.timerControlIcon}>⏸️</Text>
+                  <Text style={styles.timerControlText}>PAUSE</Text>
                 </TouchableOpacity>
               )}
               <TouchableOpacity
-                style={[styles.timerButton, styles.resetButton]}
+                style={[styles.timerControlButton, styles.resetButton]}
                 onPress={resetTimer}
               >
-                <Text style={styles.timerButtonText}>↺ RESET</Text>
+                <Text style={styles.timerControlIcon}>🔄</Text>
+                <Text style={styles.timerControlText}>RESET</Text>
               </TouchableOpacity>
             </View>
 
+            {/* Option auto-phase */}
             <TouchableOpacity
               style={styles.autoNextRow}
               onPress={() => setAutoNextPhase(!autoNextPhase)}
@@ -1015,6 +1228,125 @@ export default function GameMasterScreen({ navigation, route }) {
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* ==================== VOTES (visible pendant phase vote/result) ==================== */}
+        {(currentPhase === 'day_vote' || currentPhase === 'vote_result') && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>🗳️ Votes en cours</Text>
+
+            {/* Compteur de votes */}
+            <View style={styles.voteCounterCard}>
+              <View style={styles.voteCounterMain}>
+                <Text style={styles.voteCounterNumber}>{voteStats.totalVotes}</Text>
+                <Text style={styles.voteCounterLabel}>/ {alivePlayers.length} ont voté</Text>
+              </View>
+              {voteStats.totalVotes === alivePlayers.length && (
+                <View style={styles.allVotedBadge}>
+                  <Text style={styles.allVotedText}>✓ Tous</Text>
+                </View>
+              )}
+            </View>
+
+            {/* Liste des votes par cible */}
+            {Object.keys(voteStats.voteCounts).length > 0 ? (
+              <View style={styles.voteResultsCard}>
+                <Text style={styles.voteResultsTitle}>Décompte par joueur :</Text>
+                {Object.entries(voteStats.voteCounts)
+                  .sort(([, a], [, b]) => b - a)
+                  .map(([playerId, count]) => {
+                    const player = players.find(p => p.id === playerId);
+                    const isLeading = count === voteStats.maxVotes;
+                    const isTied = voteStats.tiedPlayers.includes(playerId);
+                    return (
+                      <View
+                        key={playerId}
+                        style={[
+                          styles.voteResultItem,
+                          isLeading && styles.voteResultItemLeading,
+                          isTied && voteStats.hasTie && styles.voteResultItemTied,
+                        ]}
+                      >
+                        <Text style={styles.voteResultName}>
+                          {player?.name || 'Inconnu'}
+                          {isTied && voteStats.hasTie && ' ⚠️'}
+                        </Text>
+                        <View style={styles.voteResultCount}>
+                          <Text style={styles.voteResultCountText}>{count}</Text>
+                          <Text style={styles.voteResultCountLabel}>vote{count > 1 ? 's' : ''}</Text>
+                        </View>
+                      </View>
+                    );
+                  })}
+
+                {/* Alerte égalité */}
+                {voteStats.hasTie && (
+                  <View style={styles.tieWarning}>
+                    <Text style={styles.tieWarningIcon}>⚠️</Text>
+                    <Text style={styles.tieWarningText}>
+                      Égalité ! Vous devrez choisir qui éliminer.
+                    </Text>
+                  </View>
+                )}
+              </View>
+            ) : (
+              <View style={styles.noVotesCard}>
+                <Text style={styles.noVotesIcon}>🗳️</Text>
+                <Text style={styles.noVotesText}>Aucun vote pour le moment</Text>
+              </View>
+            )}
+
+            {/* Détail des votes (qui a voté pour qui) */}
+            {Object.keys(votes).length > 0 && (
+              <View style={styles.voteDetailsCard}>
+                <Text style={styles.voteDetailsTitle}>Détail des votes :</Text>
+                {Object.entries(votes).map(([voterId, targetId]) => {
+                  const voter = players.find(p => p.id === voterId);
+                  const target = players.find(p => p.id === targetId);
+                  return (
+                    <Text key={voterId} style={styles.voteDetailItem}>
+                      {voter?.name || 'Inconnu'} → {target?.name || 'Inconnu'}
+                    </Text>
+                  );
+                })}
+              </View>
+            )}
+
+            {/* Boutons d'action */}
+            <View style={styles.voteActionsRow}>
+              <TouchableOpacity
+                style={[styles.resolveVoteButton, voteStats.totalVotes === 0 && styles.buttonDisabled]}
+                onPress={() => handleResolveVote()}
+                disabled={voteStats.totalVotes === 0 || isProcessing}
+              >
+                {isProcessing ? (
+                  <ActivityIndicator color="#FFF" size="small" />
+                ) : (
+                  <>
+                    <Text style={styles.resolveVoteIcon}>⚖️</Text>
+                    <Text style={styles.resolveVoteText}>Résoudre le vote</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.clearVotesButton}
+                onPress={handleClearVotes}
+              >
+                <Text style={styles.clearVotesText}>↺ Reset</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Bouton vérifier victoire */}
+            <TouchableOpacity
+              style={styles.checkVictoryButton}
+              onPress={handleCheckVictory}
+              disabled={isProcessing}
+            >
+              <Text style={styles.checkVictoryIcon}>🏆</Text>
+              <Text style={styles.checkVictoryText}>Vérifier conditions de victoire</Text>
+            </TouchableOpacity>
+          </View>
+        )}
 
         {/* ==================== JOUEURS ==================== */}
         <View style={styles.section}>
@@ -1151,6 +1483,125 @@ export default function GameMasterScreen({ navigation, route }) {
       {renderBonusModal()}
       {renderRulesModal()}
       {renderPlayerModal()}
+
+      {/* Modal égalité */}
+      <Modal
+        visible={showTieModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowTieModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>⚠️ Égalité au vote</Text>
+              <TouchableOpacity onPress={() => setShowTieModal(false)}>
+                <Text style={styles.modalClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.tieModalSubtitle}>
+              Plusieurs joueurs ont le même nombre de votes. Choisissez qui éliminer :
+            </Text>
+
+            <ScrollView style={styles.tiePlayersList}>
+              {voteStats.tiedPlayers.map(playerId => {
+                const player = players.find(p => p.id === playerId);
+                const role = getRoleById(player?.role);
+                return (
+                  <TouchableOpacity
+                    key={playerId}
+                    style={styles.tiePlayerItem}
+                    onPress={() => handleResolveVote(playerId)}
+                  >
+                    <View style={[styles.tiePlayerIcon, { backgroundColor: role?.color || '#333' }]}>
+                      <Text style={styles.tiePlayerIconText}>{role?.icon || '❓'}</Text>
+                    </View>
+                    <View style={styles.tiePlayerInfo}>
+                      <Text style={styles.tiePlayerName}>{player?.name || 'Inconnu'}</Text>
+                      <Text style={styles.tiePlayerVotes}>
+                        {voteStats.voteCounts[playerId]} votes
+                      </Text>
+                    </View>
+                    <Text style={styles.tiePlayerArrow}>→</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+
+            <TouchableOpacity
+              style={styles.tieCancelButton}
+              onPress={() => setShowTieModal(false)}
+            >
+              <Text style={styles.tieCancelText}>Annuler</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Modal victoire */}
+      <Modal
+        visible={showVictoryModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowVictoryModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.victoryModalContent}>
+            <View style={[
+              styles.victoryHeader,
+              { backgroundColor: victoryResult?.winner === 'village' ? '#1E3A8A' : '#8B0000' }
+            ]}>
+              <Text style={styles.victoryEmoji}>
+                {victoryResult?.winner === 'village' ? '🏘️' : '🐺'}
+              </Text>
+              <Text style={styles.victoryTitle}>
+                {victoryResult?.winner === 'village' ? 'Le Village gagne !' : 'Les Loups gagnent !'}
+              </Text>
+            </View>
+
+            <View style={styles.victoryBody}>
+              <Text style={styles.victoryMessage}>
+                {victoryResult?.message}
+              </Text>
+
+              {victoryResult?.stats && (
+                <View style={styles.victoryStats}>
+                  <Text style={styles.victoryStatsTitle}>Statistiques :</Text>
+                  <Text style={styles.victoryStat}>
+                    🐺 Loups vivants : {victoryResult.stats.aliveWerewolves}
+                  </Text>
+                  <Text style={styles.victoryStat}>
+                    🏘️ Villageois vivants : {victoryResult.stats.aliveVillagers}
+                  </Text>
+                  <Text style={styles.victoryStat}>
+                    💀 Morts : {victoryResult.stats.deadCount}
+                  </Text>
+                </View>
+              )}
+
+              <View style={styles.victoryButtons}>
+                <TouchableOpacity
+                  style={styles.victoryCancelButton}
+                  onPress={() => setShowVictoryModal(false)}
+                >
+                  <Text style={styles.victoryCancelText}>Continuer la partie</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[
+                    styles.victoryConfirmButton,
+                    { backgroundColor: victoryResult?.winner === 'village' ? '#1E3A8A' : '#8B0000' }
+                  ]}
+                  onPress={confirmVictory}
+                >
+                  <Text style={styles.victoryConfirmText}>🏆 Terminer la partie</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -1370,25 +1821,69 @@ const styles = StyleSheet.create({
   },
 
   // Timer
+  timerHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 15,
+  },
+  timerStatusBadge: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+  },
+  timerStatusActive: {
+    backgroundColor: 'rgba(5, 150, 105, 0.2)',
+  },
+  timerStatusPaused: {
+    backgroundColor: 'rgba(245, 158, 11, 0.2)',
+  },
+  timerStatusText: {
+    color: colors.textPrimary,
+    fontSize: 12,
+    fontWeight: '600',
+  },
   timerCard: {
     backgroundColor: colors.backgroundCard,
     borderRadius: 16,
     padding: 20,
     alignItems: 'center',
   },
-  timerDisplay: {
-    fontSize: 60,
-    fontWeight: 'bold',
-    color: colors.textPrimary,
-    fontFamily: 'monospace',
+  timerVisualContainer: {
+    marginBottom: 20,
+    alignItems: 'center',
   },
-  timerWarning: {
-    color: colors.danger,
+  timerInfinite: {
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: colors.backgroundSecondary,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 8,
+    borderColor: colors.textDisabled,
+  },
+  timerInfiniteIcon: {
+    fontSize: 60,
+    color: colors.textDisabled,
+  },
+  timerInfiniteText: {
+    color: colors.textDisabled,
+    fontSize: 12,
+    marginTop: 5,
+  },
+  timerPresetsContainer: {
+    width: '100%',
+    marginBottom: 15,
+  },
+  timerPresetsLabel: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginBottom: 8,
   },
   timerPresets: {
     flexDirection: 'row',
-    marginTop: 15,
-    marginBottom: 15,
+    flexWrap: 'wrap',
     gap: 8,
   },
   timerPreset: {
@@ -1407,16 +1902,27 @@ const styles = StyleSheet.create({
   timerPresetTextActive: {
     color: '#FFF',
   },
-  timerControls: {
+  timerControlsRow: {
     flexDirection: 'row',
     gap: 10,
     width: '100%',
+    marginBottom: 15,
   },
-  timerButton: {
+  timerControlButton: {
     flex: 1,
     paddingVertical: 15,
     borderRadius: 12,
     alignItems: 'center',
+    justifyContent: 'center',
+  },
+  timerControlIcon: {
+    fontSize: 20,
+    marginBottom: 4,
+  },
+  timerControlText: {
+    color: '#FFF',
+    fontWeight: 'bold',
+    fontSize: 12,
   },
   startButton: {
     backgroundColor: colors.success,
@@ -1426,11 +1932,6 @@ const styles = StyleSheet.create({
   },
   resetButton: {
     backgroundColor: colors.backgroundSecondary,
-  },
-  timerButtonText: {
-    color: '#FFF',
-    fontWeight: 'bold',
-    fontSize: 14,
   },
   autoNextRow: {
     flexDirection: 'row',
@@ -1734,5 +2235,325 @@ const styles = StyleSheet.create({
     color: '#FFF',
     fontWeight: 'bold',
     fontSize: 12,
+  },
+
+  // ==================== STYLES VOTES ====================
+  voteCounterCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 15,
+  },
+  voteCounterMain: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+  },
+  voteCounterNumber: {
+    color: colors.primary,
+    fontSize: 36,
+    fontWeight: 'bold',
+  },
+  voteCounterLabel: {
+    color: colors.textSecondary,
+    fontSize: 16,
+    marginLeft: 5,
+  },
+  allVotedBadge: {
+    backgroundColor: '#059669',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+  },
+  allVotedText: {
+    color: '#FFF',
+    fontWeight: 'bold',
+    fontSize: 12,
+  },
+  voteResultsCard: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 15,
+  },
+  voteResultsTitle: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginBottom: 10,
+    fontWeight: '600',
+  },
+  voteResultItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: colors.backgroundCard,
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 8,
+  },
+  voteResultItemLeading: {
+    borderLeftWidth: 3,
+    borderLeftColor: colors.primary,
+  },
+  voteResultItemTied: {
+    borderLeftWidth: 3,
+    borderLeftColor: colors.warning,
+  },
+  voteResultName: {
+    color: colors.textPrimary,
+    fontSize: 14,
+    fontWeight: '600',
+    flex: 1,
+  },
+  voteResultCount: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+  },
+  voteResultCountText: {
+    color: colors.primary,
+    fontSize: 24,
+    fontWeight: 'bold',
+  },
+  voteResultCountLabel: {
+    color: colors.textSecondary,
+    fontSize: 11,
+    marginLeft: 4,
+  },
+  tieWarning: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(245, 158, 11, 0.2)',
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 8,
+  },
+  tieWarningIcon: {
+    fontSize: 20,
+    marginRight: 10,
+  },
+  tieWarningText: {
+    color: colors.warning,
+    fontSize: 13,
+    flex: 1,
+  },
+  noVotesCard: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 30,
+    alignItems: 'center',
+    marginBottom: 15,
+  },
+  noVotesIcon: {
+    fontSize: 40,
+    marginBottom: 10,
+    opacity: 0.5,
+  },
+  noVotesText: {
+    color: colors.textSecondary,
+    fontSize: 14,
+  },
+  voteDetailsCard: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 15,
+  },
+  voteDetailsTitle: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginBottom: 10,
+    fontWeight: '600',
+  },
+  voteDetailItem: {
+    color: colors.textPrimary,
+    fontSize: 13,
+    paddingVertical: 4,
+  },
+  voteActionsRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 15,
+  },
+  resolveVoteButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: 12,
+    padding: 15,
+  },
+  resolveVoteIcon: {
+    fontSize: 20,
+    marginRight: 10,
+  },
+  resolveVoteText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  clearVotesButton: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  clearVotesText: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  checkVictoryButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 215, 0, 0.2)',
+    borderWidth: 1,
+    borderColor: colors.special,
+    borderRadius: 12,
+    padding: 15,
+  },
+  checkVictoryIcon: {
+    fontSize: 20,
+    marginRight: 10,
+  },
+  checkVictoryText: {
+    color: colors.special,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+
+  // ==================== MODAL ÉGALITÉ ====================
+  tieModalSubtitle: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    marginBottom: 20,
+    textAlign: 'center',
+  },
+  tiePlayersList: {
+    maxHeight: 300,
+  },
+  tiePlayerItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 10,
+  },
+  tiePlayerIcon: {
+    width: 50,
+    height: 50,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 15,
+  },
+  tiePlayerIconText: {
+    fontSize: 24,
+  },
+  tiePlayerInfo: {
+    flex: 1,
+  },
+  tiePlayerName: {
+    color: colors.textPrimary,
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  tiePlayerVotes: {
+    color: colors.primary,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  tiePlayerArrow: {
+    color: colors.textSecondary,
+    fontSize: 24,
+  },
+  tieCancelButton: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    alignItems: 'center',
+    marginTop: 10,
+  },
+  tieCancelText: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+
+  // ==================== MODAL VICTOIRE ====================
+  victoryModalContent: {
+    backgroundColor: colors.backgroundCard,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    overflow: 'hidden',
+  },
+  victoryHeader: {
+    padding: 30,
+    alignItems: 'center',
+  },
+  victoryEmoji: {
+    fontSize: 60,
+    marginBottom: 15,
+  },
+  victoryTitle: {
+    color: '#FFF',
+    fontSize: 28,
+    fontWeight: 'bold',
+    textAlign: 'center',
+  },
+  victoryBody: {
+    padding: 20,
+  },
+  victoryMessage: {
+    color: colors.textPrimary,
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  victoryStats: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 20,
+  },
+  victoryStatsTitle: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 10,
+  },
+  victoryStat: {
+    color: colors.textPrimary,
+    fontSize: 14,
+    paddingVertical: 3,
+  },
+  victoryButtons: {
+    gap: 10,
+  },
+  victoryCancelButton: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    alignItems: 'center',
+  },
+  victoryCancelText: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  victoryConfirmButton: {
+    borderRadius: 12,
+    padding: 15,
+    alignItems: 'center',
+  },
+  victoryConfirmText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
 });

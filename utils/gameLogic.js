@@ -75,7 +75,7 @@ export const checkPresentRoles = async (gameCode) => {
 };
 
 /**
- * Vérifie les conditions de victoire
+ * Vérifie les conditions de victoire (version locale avec objet players)
  */
 export const checkWinCondition = (players) => {
   const alivePlayers = Object.values(players).filter(p => p.isAlive && !p.isMaster);
@@ -102,6 +102,62 @@ export const checkWinCondition = (players) => {
 };
 
 /**
+ * Vérifie les conditions de victoire avec Firebase
+ * @returns {Object|null} { winner, message, stats } ou null si partie continue
+ */
+export const checkWinConditionFromFirebase = async (gameCode) => {
+  try {
+    const playersRef = ref(database, `games/${gameCode}/players`);
+    const snapshot = await get(playersRef);
+
+    if (!snapshot.exists()) {
+      return null;
+    }
+
+    const players = snapshot.val();
+    const result = checkWinCondition(players);
+
+    if (result) {
+      // Ajouter des statistiques
+      const alivePlayers = Object.values(players).filter(p => p.isAlive !== false && !p.isMaster);
+      const deadPlayers = Object.values(players).filter(p => p.isAlive === false && !p.isMaster);
+
+      result.stats = {
+        aliveCount: alivePlayers.length,
+        deadCount: deadPlayers.length,
+        aliveWerewolves: alivePlayers.filter(p => getRoleById(p.role)?.team === 'loups').length,
+        aliveVillagers: alivePlayers.filter(p => getRoleById(p.role)?.team === 'village').length,
+      };
+    }
+
+    return result;
+  } catch (error) {
+    console.error('Erreur checkWinConditionFromFirebase:', error);
+    return null;
+  }
+};
+
+/**
+ * Termine la partie avec un gagnant
+ */
+export const endGameWithWinner = async (gameCode, winner, message = '') => {
+  try {
+    const updates = {};
+    updates[`games/${gameCode}/config/status`] = 'finished';
+    updates[`games/${gameCode}/gameState/currentPhase`] = 'finished';
+    updates[`games/${gameCode}/gameState/endedAt`] = Date.now();
+    updates[`games/${gameCode}/result/winner`] = winner;
+    updates[`games/${gameCode}/result/message`] = message;
+
+    await update(ref(database), updates);
+    return true;
+  } catch (error) {
+    console.error('Erreur endGameWithWinner:', error);
+    return false;
+  }
+};
+
+/**
  * Élimine un joueur
  */
 export const eliminatePlayer = async (gameCode, playerId, reason = 'eliminated') => {
@@ -119,6 +175,91 @@ export const eliminatePlayer = async (gameCode, playerId, reason = 'eliminated')
 };
 
 /**
+ * Définition du flux de phases complet
+ */
+export const PHASE_FLOW = {
+  'role_reveal': 'night_start',
+  'night_start': 'night_cupid',
+  'night_cupid': 'night_werewolves',
+  'night_werewolves': 'night_seer',
+  'night_seer': 'night_witch',
+  'night_witch': 'day_announcement',
+  'day_announcement': 'day_discussion',
+  'day_discussion': 'day_vote',
+  'day_vote': 'vote_result',
+  'vote_result': 'night_start',
+  'finished': 'finished',
+};
+
+/**
+ * Phases qui correspondent à des rôles spéciaux (peuvent être skip)
+ */
+const ROLE_PHASES = {
+  'night_cupid': 'cupidon',
+  'night_seer': 'voyante',
+  'night_witch': 'sorciere',
+};
+
+/**
+ * Détermine si une phase doit être sautée
+ * @param {string} phase - La phase à vérifier
+ * @param {Object} presentRoles - Rôles présents dans la partie
+ * @param {number} nightCount - Numéro de la nuit actuelle
+ * @returns {boolean} - true si la phase doit être sautée
+ */
+export const shouldSkipPhase = (phase, presentRoles, nightCount = 0) => {
+  // Les phases obligatoires ne sont jamais sautées
+  const mandatoryPhases = [
+    'role_reveal', 'night_start', 'night_werewolves',
+    'day_announcement', 'day_discussion', 'day_vote', 'vote_result', 'finished'
+  ];
+
+  if (mandatoryPhases.includes(phase)) {
+    return false;
+  }
+
+  // Vérifier les phases de rôles spéciaux
+  switch (phase) {
+    case 'night_cupid':
+      // Cupidon ne joue que la première nuit ET s'il est présent ET vivant
+      return !presentRoles.hasCupid || nightCount > 0;
+
+    case 'night_seer':
+      // Voyante doit être présente et vivante
+      return !presentRoles.hasSeer;
+
+    case 'night_witch':
+      // Sorcière doit être présente et vivante
+      return !presentRoles.hasWitch;
+
+    default:
+      return false;
+  }
+};
+
+/**
+ * Retourne la liste des phases valides pour cette partie
+ * @param {Object} presentRoles - Rôles présents dans la partie
+ * @param {number} nightCount - Numéro de la nuit actuelle
+ * @returns {Array} - Liste des phases valides
+ */
+export const getValidPhasesForGame = (presentRoles, nightCount = 0) => {
+  const allPhases = [
+    'night_start',
+    'night_cupid',
+    'night_werewolves',
+    'night_seer',
+    'night_witch',
+    'day_announcement',
+    'day_discussion',
+    'day_vote',
+    'vote_result',
+  ];
+
+  return allPhases.filter(phase => !shouldSkipPhase(phase, presentRoles, nightCount));
+};
+
+/**
  * Détermine la prochaine phase valide en sautant les rôles absents
  * @param {string} currentPhase - Phase actuelle
  * @param {Object} presentRoles - Rôles présents dans la partie
@@ -126,21 +267,6 @@ export const eliminatePlayer = async (gameCode, playerId, reason = 'eliminated')
  * @returns {string} - Prochaine phase valide
  */
 export const getNextValidPhase = (currentPhase, presentRoles, nightCount = 0) => {
-  // Définition complète des phases avec leurs conditions
-  const PHASE_FLOW = {
-    'role_reveal': 'night_start',
-    'night_start': 'night_cupid',
-    'night_cupid': 'night_werewolves',
-    'night_werewolves': 'night_seer',
-    'night_seer': 'night_witch',
-    'night_witch': 'day_announcement',
-    'day_announcement': 'day_discussion',
-    'day_discussion': 'day_vote',
-    'day_vote': 'vote_result',
-    'vote_result': 'night_start',
-    'finished': 'finished',
-  };
-
   let nextPhase = PHASE_FLOW[currentPhase] || 'night_start';
 
   // Boucle pour trouver la prochaine phase valide
@@ -149,26 +275,7 @@ export const getNextValidPhase = (currentPhase, presentRoles, nightCount = 0) =>
 
   while (iterations < maxIterations) {
     // Vérifier si la phase doit être sautée
-    let shouldSkip = false;
-
-    switch (nextPhase) {
-      case 'night_cupid':
-        // Cupidon ne joue que la première nuit ET s'il est présent
-        shouldSkip = !presentRoles.hasCupid || nightCount > 0;
-        break;
-      case 'night_seer':
-        // Voyante doit être présente et vivante
-        shouldSkip = !presentRoles.hasSeer;
-        break;
-      case 'night_witch':
-        // Sorcière doit être présente et vivante
-        shouldSkip = !presentRoles.hasWitch;
-        break;
-      default:
-        shouldSkip = false;
-    }
-
-    if (!shouldSkip) {
+    if (!shouldSkipPhase(nextPhase, presentRoles, nightCount)) {
       return nextPhase;
     }
 
@@ -468,35 +575,172 @@ export const getNightActionsForMJ = async (gameCode, nightCount) => {
 };
 
 /**
- * Résout le vote et élimine le joueur le plus voté
+ * Compte les votes et retourne les statistiques
+ * @returns {Object} { voteCounts, totalVotes, maxVotes, tiedPlayers, winner }
  */
-export const resolveVote = async (gameCode, votes) => {
-  try {
-    // Compte les votes
-    const voteCounts = {};
-    Object.values(votes).forEach(votedPlayerId => {
+export const countVotes = (votes) => {
+  const voteCounts = {};
+  let totalVotes = 0;
+
+  // Compter les votes
+  Object.values(votes).forEach(votedPlayerId => {
+    if (votedPlayerId) {
       voteCounts[votedPlayerId] = (voteCounts[votedPlayerId] || 0) + 1;
-    });
+      totalVotes++;
+    }
+  });
 
-    // Trouve le joueur avec le plus de votes
-    let maxVotes = 0;
-    let eliminatedPlayerId = null;
+  // Trouver le maximum
+  let maxVotes = 0;
+  Object.values(voteCounts).forEach(count => {
+    if (count > maxVotes) maxVotes = count;
+  });
 
-    Object.entries(voteCounts).forEach(([playerId, count]) => {
-      if (count > maxVotes) {
-        maxVotes = count;
-        eliminatedPlayerId = playerId;
-      }
-    });
+  // Trouver les joueurs à égalité
+  const tiedPlayers = Object.entries(voteCounts)
+    .filter(([_, count]) => count === maxVotes)
+    .map(([playerId]) => playerId);
 
-    // Élimine le joueur
-    if (eliminatedPlayerId) {
-      await eliminatePlayer(gameCode, eliminatedPlayerId, 'vote');
+  return {
+    voteCounts,
+    totalVotes,
+    maxVotes,
+    tiedPlayers,
+    winner: tiedPlayers.length === 1 ? tiedPlayers[0] : null,
+    hasTie: tiedPlayers.length > 1,
+  };
+};
+
+/**
+ * Récupère les votes actuels depuis Firebase
+ */
+export const getVotes = async (gameCode) => {
+  try {
+    const votesRef = ref(database, `games/${gameCode}/votes`);
+    const snapshot = await get(votesRef);
+
+    if (!snapshot.exists()) {
+      return {};
     }
 
-    return eliminatedPlayerId;
+    return snapshot.val();
+  } catch (error) {
+    console.error('Erreur getVotes:', error);
+    return {};
+  }
+};
+
+/**
+ * Résout le vote et élimine le joueur le plus voté
+ * @param {string} gameCode
+ * @param {Object} votes - Votes { voterId: targetId }
+ * @param {string|null} forcedWinner - Si égalité, le MJ peut forcer un gagnant
+ * @returns {Object} { eliminated, voteCounts, hasTie, tiedPlayers }
+ */
+export const resolveVote = async (gameCode, votes, forcedWinner = null) => {
+  try {
+    const voteStats = countVotes(votes);
+    let eliminatedPlayerId = null;
+
+    // S'il y a égalité et pas de forcedWinner, retourner les infos pour le MJ
+    if (voteStats.hasTie && !forcedWinner) {
+      return {
+        eliminated: null,
+        voteCounts: voteStats.voteCounts,
+        hasTie: true,
+        tiedPlayers: voteStats.tiedPlayers,
+        maxVotes: voteStats.maxVotes,
+      };
+    }
+
+    // Déterminer qui éliminer
+    eliminatedPlayerId = forcedWinner || voteStats.winner;
+
+    // Éliminer le joueur
+    if (eliminatedPlayerId) {
+      await eliminatePlayer(gameCode, eliminatedPlayerId, 'vote');
+
+      // Gérer l'effet des amoureux
+      await handleLoversEffect(gameCode, eliminatedPlayerId);
+
+      // Stocker le résultat du vote
+      await update(ref(database), {
+        [`games/${gameCode}/gameState/lastVoteResult`]: {
+          eliminatedId: eliminatedPlayerId,
+          voteCounts: voteStats.voteCounts,
+          totalVotes: voteStats.totalVotes,
+          timestamp: Date.now(),
+        },
+      });
+    }
+
+    return {
+      eliminated: eliminatedPlayerId,
+      voteCounts: voteStats.voteCounts,
+      hasTie: false,
+      tiedPlayers: [],
+      maxVotes: voteStats.maxVotes,
+    };
   } catch (error) {
     console.error('Erreur resolveVote:', error);
+    return { eliminated: null, voteCounts: {}, hasTie: false, tiedPlayers: [] };
+  }
+};
+
+/**
+ * Réinitialise les votes pour une nouvelle phase
+ */
+export const clearVotes = async (gameCode) => {
+  try {
+    await set(ref(database, `games/${gameCode}/votes`), null);
+    return true;
+  } catch (error) {
+    console.error('Erreur clearVotes:', error);
+    return false;
+  }
+};
+
+/**
+ * Gère l'effet de la mort d'un amoureux (l'autre meurt aussi)
+ * @returns {Object|null} L'autre amoureux tué ou null
+ */
+export const handleLoversEffect = async (gameCode, deadPlayerId) => {
+  try {
+    const lovers = await getLovers(gameCode);
+    if (!lovers) return null;
+
+    let otherLoverId = null;
+    let otherLoverName = null;
+
+    // Vérifier si le joueur mort est un amoureux
+    if (lovers.player1 === deadPlayerId) {
+      otherLoverId = lovers.player2;
+      otherLoverName = lovers.player2Name;
+    } else if (lovers.player2 === deadPlayerId) {
+      otherLoverId = lovers.player1;
+      otherLoverName = lovers.player1Name;
+    }
+
+    if (!otherLoverId) return null;
+
+    // Vérifier si l'autre est encore vivant
+    const otherPlayerRef = ref(database, `games/${gameCode}/players/${otherLoverId}`);
+    const snapshot = await get(otherPlayerRef);
+
+    if (snapshot.exists() && snapshot.val().isAlive !== false) {
+      // L'autre amoureux meurt de chagrin
+      await eliminatePlayer(gameCode, otherLoverId, 'heartbreak');
+
+      return {
+        id: otherLoverId,
+        name: otherLoverName,
+        reason: 'heartbreak',
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Erreur handleLoversEffect:', error);
     return null;
   }
 };
@@ -539,7 +783,12 @@ export default {
   assignRoles,
   checkPresentRoles,
   checkWinCondition,
+  checkWinConditionFromFirebase,
+  endGameWithWinner,
   eliminatePlayer,
+  PHASE_FLOW,
+  shouldSkipPhase,
+  getValidPhasesForGame,
   getNextValidPhase,
   nextPhase,
   getLovers,
@@ -547,7 +796,11 @@ export default {
   getLastNightVictims,
   resolveNightActions,
   getNightActionsForMJ,
+  countVotes,
+  getVotes,
   resolveVote,
+  clearVotes,
+  handleLoversEffect,
   toggleTimer,
   resetTimer
 };

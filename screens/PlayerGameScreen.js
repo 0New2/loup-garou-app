@@ -17,6 +17,7 @@ import { database } from '../firebase';
 import { getRoleById, ROLES } from '../utils/roles';
 import { useDevMode } from '../contexts/DevModeContext';
 import colors from '../constants/colors';
+import Timer, { TimerBar, TimerBadge } from '../components/Timer';
 
 // Mapping des phases pour l'UI joueur
 const PHASE_INFO = {
@@ -65,9 +66,13 @@ export default function PlayerGameScreen({ navigation, route }) {
   const [showSeerResultModal, setShowSeerResultModal] = useState(false);
   const [seerResult, setSeerResult] = useState(null);
 
-  // Timer
+  // État du résultat du vote
+  const [lovers, setLovers] = useState(null);
+
+  // Timer (lecture seule - controle par le MJ)
   const [timerValue, setTimerValue] = useState(null);
-  const timerRef = useRef(null);
+  const [timerDuration, setTimerDuration] = useState(null);
+  const [isTimerRunning, setIsTimerRunning] = useState(false);
 
   // Animation
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -148,9 +153,15 @@ export default function PlayerGameScreen({ navigation, route }) {
           setLastNightVictims([]);
         }
 
-        // Synchroniser le timer
+        // Synchroniser le timer (lecture seule depuis Firebase)
         if (state.timer !== undefined) {
           setTimerValue(state.timer);
+        }
+        if (state.timerDuration !== undefined) {
+          setTimerDuration(state.timerDuration);
+        }
+        if (state.timerRunning !== undefined) {
+          setIsTimerRunning(state.timerRunning);
         }
       }
     });
@@ -160,9 +171,9 @@ export default function PlayerGameScreen({ navigation, route }) {
       if (snapshot.exists()) {
         setGameConfig(snapshot.val());
 
-        // Si la partie est terminée
+        // Si la partie est terminée, naviguer vers EndGame
         if (snapshot.val().status === 'finished') {
-          navigation.replace('Menu');
+          navigation.replace('EndGame', { gameCode, playerId });
         }
       }
     });
@@ -174,11 +185,12 @@ export default function PlayerGameScreen({ navigation, route }) {
       }
     });
 
-    // Écouter si les amoureux sont déjà formés
+    // Écouter les amoureux
     const loversRef = ref(database, `games/${gameCode}/lovers`);
     const unsubLovers = onValue(loversRef, (snapshot) => {
       if (snapshot.exists()) {
         setLoversFormed(true);
+        setLovers(snapshot.val());
       }
     });
 
@@ -192,18 +204,9 @@ export default function PlayerGameScreen({ navigation, route }) {
     };
   }, [gameCode, playerId, gameState?.nightCount]);
 
-  // Timer local
-  useEffect(() => {
-    if (gameState?.timerRunning && timerValue !== null && timerValue > 0) {
-      timerRef.current = setInterval(() => {
-        setTimerValue((prev) => (prev > 0 ? prev - 1 : 0));
-      }, 1000);
-    }
-
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, [gameState?.timerRunning, timerValue]);
+  // Note: Le timer est maintenant en lecture seule
+  // Le MJ controle le timer et le synchronise via Firebase
+  // Le joueur voit simplement la valeur mise a jour en temps reel
 
   // Helpers
   const currentPhase = gameState?.currentPhase || 'role_reveal';
@@ -727,15 +730,17 @@ export default function PlayerGameScreen({ navigation, route }) {
         <Text style={styles.dayTitle}>Le village débat</Text>
       </View>
 
-      {timerValue !== null && (
+      {timerValue !== null && timerDuration !== null && (
         <View style={styles.timerContainer}>
-          <Text style={styles.timerLabel}>Temps restant</Text>
-          <Text style={[
-            styles.timerValue,
-            timerValue <= 10 && styles.timerWarning
-          ]}>
-            {formatTime(timerValue)}
-          </Text>
+          <Timer
+            duration={timerDuration}
+            remainingTime={timerValue}
+            isActive={isTimerRunning}
+            isMaster={false}
+            size="small"
+            showLabel={true}
+            enableVibration={true}
+          />
         </View>
       )}
 
@@ -768,15 +773,17 @@ export default function PlayerGameScreen({ navigation, route }) {
         <Text style={styles.voteTitle}>Vote du village</Text>
       </View>
 
-      {timerValue !== null && (
+      {timerValue !== null && timerDuration !== null && (
         <View style={styles.timerContainer}>
-          <Text style={styles.timerLabel}>Temps restant</Text>
-          <Text style={[
-            styles.timerValue,
-            timerValue <= 10 && styles.timerWarning
-          ]}>
-            {formatTime(timerValue)}
-          </Text>
+          <Timer
+            duration={timerDuration}
+            remainingTime={timerValue}
+            isActive={isTimerRunning}
+            isMaster={false}
+            size="small"
+            showLabel={true}
+            enableVibration={true}
+          />
         </View>
       )}
 
@@ -799,6 +806,93 @@ export default function PlayerGameScreen({ navigation, route }) {
       )}
     </View>
   );
+
+  // Interface résultat du vote
+  const renderVoteResult = () => {
+    const eliminatedId = gameState?.lastEliminatedId;
+    const eliminatedName = gameState?.lastEliminatedName;
+    const eliminatedRoleId = gameState?.lastEliminatedRole;
+    const eliminatedRole = eliminatedRoleId ? getRoleById(eliminatedRoleId) : null;
+
+    // Vérifier si l'éliminé est un amoureux
+    let otherLoverDied = null;
+    if (lovers && eliminatedId) {
+      if (lovers.player1 === eliminatedId) {
+        otherLoverDied = {
+          id: lovers.player2,
+          name: lovers.player2Name,
+        };
+      } else if (lovers.player2 === eliminatedId) {
+        otherLoverDied = {
+          id: lovers.player1,
+          name: lovers.player1Name,
+        };
+      }
+    }
+
+    return (
+      <View style={styles.voteResultContainer}>
+        <View style={styles.voteResultHeader}>
+          <Text style={styles.voteResultEmoji}>⚖️</Text>
+          <Text style={styles.voteResultTitle}>Verdict du village</Text>
+        </View>
+
+        {eliminatedId ? (
+          <>
+            {/* Carte de l'éliminé */}
+            <View style={[
+              styles.eliminatedCard,
+              { borderColor: eliminatedRole?.color || colors.danger }
+            ]}>
+              <Text style={styles.eliminatedCardLabel}>Le village a décidé...</Text>
+              <View style={[
+                styles.eliminatedRoleIcon,
+                { backgroundColor: eliminatedRole?.color || colors.danger }
+              ]}>
+                <Text style={styles.eliminatedRoleEmoji}>{eliminatedRole?.icon || '❓'}</Text>
+              </View>
+              <Text style={styles.eliminatedName}>{eliminatedName}</Text>
+              <Text style={styles.eliminatedReason}>a été éliminé(e) par le vote</Text>
+              <View style={styles.eliminatedRoleReveal}>
+                <Text style={styles.eliminatedRoleLabel}>était</Text>
+                <Text style={[styles.eliminatedRoleName, { color: eliminatedRole?.color }]}>
+                  {eliminatedRole?.name || 'Inconnu'}
+                </Text>
+                <Text style={styles.eliminatedRoleTeam}>
+                  {eliminatedRole?.team === 'loups' ? '🐺 Loup-Garou' : '🏘️ Village'}
+                </Text>
+              </View>
+            </View>
+
+            {/* Si un amoureux meurt de chagrin */}
+            {otherLoverDied && (
+              <View style={styles.heartbreakCard}>
+                <Text style={styles.heartbreakIcon}>💔</Text>
+                <Text style={styles.heartbreakText}>
+                  {otherLoverDied.name} est mort(e) de chagrin
+                </Text>
+                <Text style={styles.heartbreakSubtext}>
+                  Il/Elle était l'amoureux(se) de {eliminatedName}
+                </Text>
+              </View>
+            )}
+          </>
+        ) : (
+          <View style={styles.noEliminationCard}>
+            <Text style={styles.noEliminationIcon}>🎉</Text>
+            <Text style={styles.noEliminationText}>Aucune élimination</Text>
+            <Text style={styles.noEliminationSubtext}>
+              Le vote n'a pas abouti à une élimination.
+            </Text>
+          </View>
+        )}
+
+        <Text style={styles.voteResultHint}>
+          Le Maître du Jeu va vérifier les conditions de victoire...
+        </Text>
+      </View>
+    );
+  };
 
   // Modal résultat voyante
   const renderSeerResultModal = () => (
@@ -953,6 +1047,9 @@ export default function PlayerGameScreen({ navigation, route }) {
 
       case 'day_vote':
         return renderVoteInterface();
+
+      case 'vote_result':
+        return renderVoteResult();
 
       default:
         // Phase par défaut (jour, annonce, etc.)
@@ -1810,5 +1907,140 @@ const styles = StyleSheet.create({
   roleModalCloseText: {
     color: colors.textSecondary,
     fontSize: 16,
+  },
+
+  // ==================== STYLES VOTE RESULT ====================
+  voteResultContainer: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 20,
+  },
+  voteResultHeader: {
+    alignItems: 'center',
+    marginBottom: 30,
+  },
+  voteResultEmoji: {
+    fontSize: 70,
+    marginBottom: 15,
+  },
+  voteResultTitle: {
+    color: colors.textPrimary,
+    fontSize: 28,
+    fontWeight: 'bold',
+    textAlign: 'center',
+  },
+  eliminatedCard: {
+    backgroundColor: colors.backgroundCard,
+    borderRadius: 20,
+    padding: 30,
+    alignItems: 'center',
+    width: '100%',
+    marginBottom: 20,
+    borderWidth: 2,
+  },
+  eliminatedCardLabel: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    marginBottom: 20,
+  },
+  eliminatedRoleIcon: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  eliminatedRoleEmoji: {
+    fontSize: 50,
+  },
+  eliminatedName: {
+    color: colors.textPrimary,
+    fontSize: 28,
+    fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  eliminatedReason: {
+    color: colors.danger,
+    fontSize: 16,
+    marginBottom: 25,
+  },
+  eliminatedRoleReveal: {
+    alignItems: 'center',
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    padding: 15,
+    width: '100%',
+  },
+  eliminatedRoleLabel: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginBottom: 5,
+  },
+  eliminatedRoleName: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  eliminatedRoleTeam: {
+    color: colors.textSecondary,
+    fontSize: 14,
+  },
+  heartbreakCard: {
+    backgroundColor: 'rgba(236, 72, 153, 0.2)',
+    borderRadius: 16,
+    padding: 20,
+    alignItems: 'center',
+    width: '100%',
+    marginBottom: 20,
+    borderWidth: 2,
+    borderColor: '#EC4899',
+  },
+  heartbreakIcon: {
+    fontSize: 50,
+    marginBottom: 10,
+  },
+  heartbreakText: {
+    color: '#EC4899',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 5,
+    textAlign: 'center',
+  },
+  heartbreakSubtext: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  noEliminationCard: {
+    backgroundColor: 'rgba(16, 185, 129, 0.2)',
+    borderRadius: 20,
+    padding: 30,
+    alignItems: 'center',
+    width: '100%',
+    marginBottom: 20,
+    borderWidth: 2,
+    borderColor: colors.success,
+  },
+  noEliminationIcon: {
+    fontSize: 50,
+    marginBottom: 15,
+  },
+  noEliminationText: {
+    color: colors.success,
+    fontSize: 22,
+    fontWeight: 'bold',
+    marginBottom: 10,
+  },
+  noEliminationSubtext: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  voteResultHint: {
+    color: colors.textDisabled,
+    fontSize: 14,
+    textAlign: 'center',
+    fontStyle: 'italic',
   },
 });

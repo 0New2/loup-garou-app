@@ -15,6 +15,7 @@ import { ref, onValue, off, set, remove, update } from 'firebase/database';
 import { database } from '../firebase';
 import { useDevMode } from '../contexts/DevModeContext';
 import { ROLES, getDefaultRoleDistribution, getRoleById } from '../utils/roles';
+import { countVotes, resolveVote, clearVotes, checkWinCondition } from '../utils/gameLogic';
 import colors from '../constants/colors';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -47,6 +48,12 @@ export default function DevPanel() {
   const [isTestingAllRoles, setIsTestingAllRoles] = useState(false);
   const testAllRolesRef = useRef(null);
 
+  // États pour les tests de vote
+  const [votes, setVotes] = useState({});
+  const [voteStats, setVoteStats] = useState({ voteCounts: {}, totalVotes: 0, hasTie: false, tiedPlayers: [] });
+  const [lovers, setLovers] = useState(null);
+  const [simulateLoversEnabled, setSimulateLoversEnabled] = useState(false);
+
   // Liste des rôles disponibles
   const availableRoles = Object.values(ROLES);
 
@@ -77,10 +84,31 @@ export default function DevPanel() {
       setGameConfig(snapshot.exists() ? snapshot.val() : null);
     });
 
+    // Écouter les votes
+    const votesRef = ref(database, `games/${currentGameCode}/votes`);
+    const unsubVotes = onValue(votesRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const votesData = snapshot.val();
+        setVotes(votesData);
+        setVoteStats(countVotes(votesData));
+      } else {
+        setVotes({});
+        setVoteStats({ voteCounts: {}, totalVotes: 0, hasTie: false, tiedPlayers: [] });
+      }
+    });
+
+    // Écouter les amoureux
+    const loversRef = ref(database, `games/${currentGameCode}/lovers`);
+    const unsubLovers = onValue(loversRef, (snapshot) => {
+      setLovers(snapshot.exists() ? snapshot.val() : null);
+    });
+
     return () => {
       off(playersRef);
       off(stateRef);
       off(configRef);
+      off(votesRef);
+      off(loversRef);
     };
   }, [currentGameCode, isDevPanelVisible]);
 
@@ -231,6 +259,413 @@ export default function DevPanel() {
     } catch (error) {
       addLog(`Erreur changement statut: ${error.message}`);
     }
+  };
+
+  // ==================== FONCTIONS VOTE TEST ====================
+
+  // Simuler la phase de vote
+  const simulateVotePhase = async () => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      // Forcer la phase de vote
+      await update(ref(database), {
+        [`games/${currentGameCode}/gameState/currentPhase`]: 'day_vote',
+        [`games/${currentGameCode}/gameState/lastPhaseChange`]: Date.now(),
+      });
+      addLog('Phase vote simulée');
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Remplir des votes aléatoires
+  const fillRandomVotes = async () => {
+    if (!currentGameCode) return;
+
+    const alivePlayers = gamePlayers.filter(p => p.isAlive !== false);
+    if (alivePlayers.length < 2) {
+      Alert.alert('Erreur', 'Pas assez de joueurs vivants');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const newVotes = {};
+      for (const voter of alivePlayers) {
+        // Voter pour un joueur aléatoire (différent de soi-même)
+        const validTargets = alivePlayers.filter(p => p.id !== voter.id);
+        const randomTarget = validTargets[Math.floor(Math.random() * validTargets.length)];
+        newVotes[voter.id] = randomTarget.id;
+      }
+
+      await set(ref(database, `games/${currentGameCode}/votes`), newVotes);
+      addLog(`${alivePlayers.length} votes aléatoires créés`);
+    } catch (error) {
+      addLog(`Erreur votes aléatoires: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Créer une égalité au vote
+  const createTieVotes = async () => {
+    if (!currentGameCode) return;
+
+    const alivePlayers = gamePlayers.filter(p => p.isAlive !== false);
+    if (alivePlayers.length < 4) {
+      Alert.alert('Erreur', 'Minimum 4 joueurs vivants pour créer une égalité');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const target1 = alivePlayers[0];
+      const target2 = alivePlayers[1];
+      const voters = alivePlayers.slice(2);
+
+      const newVotes = {};
+      voters.forEach((voter, index) => {
+        // Alterner les votes entre les deux cibles
+        newVotes[voter.id] = index % 2 === 0 ? target1.id : target2.id;
+      });
+      // Les deux cibles votent l'une pour l'autre
+      newVotes[target1.id] = target2.id;
+      newVotes[target2.id] = target1.id;
+
+      await set(ref(database, `games/${currentGameCode}/votes`), newVotes);
+      addLog(`Égalité créée entre ${target1.name} et ${target2.name}`);
+    } catch (error) {
+      addLog(`Erreur création égalité: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Effacer tous les votes
+  const handleClearVotes = async () => {
+    if (!currentGameCode) return;
+
+    try {
+      await clearVotes(currentGameCode);
+      addLog('Votes effacés');
+    } catch (error) {
+      addLog(`Erreur effacement votes: ${error.message}`);
+    }
+  };
+
+  // Simuler des amoureux
+  const simulateLovers = async () => {
+    if (!currentGameCode) return;
+
+    const alivePlayers = gamePlayers.filter(p => p.isAlive !== false);
+    if (alivePlayers.length < 2) {
+      Alert.alert('Erreur', 'Minimum 2 joueurs vivants');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const lover1 = alivePlayers[0];
+      const lover2 = alivePlayers[1];
+
+      await set(ref(database, `games/${currentGameCode}/lovers`), {
+        player1: lover1.id,
+        player1Name: lover1.name,
+        player2: lover2.id,
+        player2Name: lover2.name,
+        formedAt: Date.now(),
+      });
+      addLog(`Amoureux créés: ${lover1.name} + ${lover2.name}`);
+    } catch (error) {
+      addLog(`Erreur création amoureux: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Supprimer les amoureux
+  const removeLovers = async () => {
+    if (!currentGameCode) return;
+
+    try {
+      await remove(ref(database, `games/${currentGameCode}/lovers`));
+      addLog('Amoureux supprimés');
+    } catch (error) {
+      addLog(`Erreur suppression amoureux: ${error.message}`);
+    }
+  };
+
+  // Tester scénario victoire village
+  const testVillageWins = async () => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      // Tuer tous les loups
+      const updates = {};
+      gamePlayers.forEach(player => {
+        const role = getRoleById(player.role);
+        if (role?.team === 'loups') {
+          updates[`games/${currentGameCode}/players/${player.id}/isAlive`] = false;
+        }
+      });
+
+      if (Object.keys(updates).length === 0) {
+        Alert.alert('Erreur', 'Aucun loup dans la partie');
+        return;
+      }
+
+      await update(ref(database), updates);
+      addLog('Tous les loups tués - Test victoire village');
+
+      // Vérifier la condition
+      const result = checkWinCondition(gamePlayers.reduce((acc, p) => {
+        const role = getRoleById(p.role);
+        acc[p.id] = { ...p, isAlive: role?.team !== 'loups' };
+        return acc;
+      }, {}));
+
+      if (result) {
+        Alert.alert('Résultat', `${result.winner === 'village' ? '✓ Village gagne' : 'Loups gagnent'}\n\n${result.message}`);
+      }
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Tester scénario victoire loups
+  const testWolvesWin = async () => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      // Compter les loups et villageois
+      const wolves = gamePlayers.filter(p => getRoleById(p.role)?.team === 'loups');
+      const villagers = gamePlayers.filter(p => getRoleById(p.role)?.team === 'village');
+
+      if (wolves.length === 0) {
+        Alert.alert('Erreur', 'Aucun loup dans la partie');
+        return;
+      }
+
+      // Tuer des villageois jusqu'à égalité
+      const villagersToKill = villagers.slice(0, villagers.length - wolves.length + 1);
+
+      const updates = {};
+      villagersToKill.forEach(player => {
+        updates[`games/${currentGameCode}/players/${player.id}/isAlive`] = false;
+      });
+
+      await update(ref(database), updates);
+      addLog(`${villagersToKill.length} villageois tués - Test victoire loups`);
+
+      // Vérifier la condition
+      const survivingPlayers = gamePlayers.reduce((acc, p) => {
+        const isKilled = villagersToKill.some(k => k.id === p.id);
+        acc[p.id] = { ...p, isAlive: !isKilled && p.isAlive !== false };
+        return acc;
+      }, {});
+
+      const result = checkWinCondition(survivingPlayers);
+      if (result) {
+        Alert.alert('Résultat', `${result.winner === 'loups' ? '✓ Loups gagnent' : 'Village gagne'}\n\n${result.message}`);
+      }
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Ressusciter tous les joueurs
+  const reviveAllPlayers = async () => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      const updates = {};
+      gamePlayers.forEach(player => {
+        updates[`games/${currentGameCode}/players/${player.id}/isAlive`] = true;
+      });
+
+      await update(ref(database), updates);
+      addLog('Tous les joueurs ressuscités');
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // ==================== FONCTIONS TEST FIN DE PARTIE ====================
+
+  // Simuler victoire village avec historique
+  const simulateVillageVictory = async () => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      const updates = {};
+
+      // Tuer tous les loups
+      gamePlayers.forEach(player => {
+        const role = getRoleById(player.role);
+        if (role?.team === 'loups') {
+          updates[`games/${currentGameCode}/players/${player.id}/isAlive`] = false;
+          updates[`games/${currentGameCode}/players/${player.id}/deathReason`] = 'voted';
+          updates[`games/${currentGameCode}/players/${player.id}/deathNight`] = 3;
+        }
+      });
+
+      // Créer l'état de fin
+      updates[`games/${currentGameCode}/config/status`] = 'finished';
+      updates[`games/${currentGameCode}/gameState/currentPhase`] = 'finished';
+      updates[`games/${currentGameCode}/gameState/nightCount`] = 5;
+      updates[`games/${currentGameCode}/gameState/endedAt`] = Date.now();
+      updates[`games/${currentGameCode}/result/winner`] = 'village';
+      updates[`games/${currentGameCode}/result/message`] = 'Tous les loups ont été éliminés !';
+
+      await update(ref(database), updates);
+      addLog('Victoire village simulée');
+
+      // Naviguer vers EndGame
+      const nav = getNavigation();
+      if (nav) {
+        setIsDevPanelVisible(false);
+        setTimeout(() => {
+          nav.replace('EndGame', { gameCode: currentGameCode, playerId: currentPlayerId });
+        }, 300);
+      }
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Simuler victoire loups avec historique
+  const simulateWolvesVictory = async () => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      const updates = {};
+
+      // Tuer assez de villageois pour que les loups gagnent
+      const wolves = gamePlayers.filter(p => getRoleById(p.role)?.team === 'loups');
+      const villagers = gamePlayers.filter(p => getRoleById(p.role)?.team === 'village');
+
+      // Tuer des villageois jusqu'à égalité ou moins
+      const villagersToKill = villagers.slice(0, villagers.length - wolves.length + 1);
+
+      villagersToKill.forEach((player, index) => {
+        updates[`games/${currentGameCode}/players/${player.id}/isAlive`] = false;
+        updates[`games/${currentGameCode}/players/${player.id}/deathReason`] = index % 2 === 0 ? 'devoured' : 'voted';
+        updates[`games/${currentGameCode}/players/${player.id}/deathNight`] = Math.floor(index / 2) + 1;
+      });
+
+      // Créer l'état de fin
+      updates[`games/${currentGameCode}/config/status`] = 'finished';
+      updates[`games/${currentGameCode}/gameState/currentPhase`] = 'finished';
+      updates[`games/${currentGameCode}/gameState/nightCount`] = 4;
+      updates[`games/${currentGameCode}/gameState/endedAt`] = Date.now();
+      updates[`games/${currentGameCode}/result/winner`] = 'loups';
+      updates[`games/${currentGameCode}/result/message`] = 'Les loups sont en supériorité numérique !';
+
+      await update(ref(database), updates);
+      addLog('Victoire loups simulée');
+
+      // Naviguer vers EndGame
+      const nav = getNavigation();
+      if (nav) {
+        setIsDevPanelVisible(false);
+        setTimeout(() => {
+          nav.replace('EndGame', { gameCode: currentGameCode, playerId: currentPlayerId });
+        }, 300);
+      }
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Simuler fin avec configuration personnalisée
+  const simulateCustomEndGame = async (winner, nightsPlayed = 5) => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      const updates = {};
+
+      // Tuer des joueurs aléatoirement
+      const playersToKill = gamePlayers.slice(0, Math.floor(gamePlayers.length / 2));
+      const deathReasons = ['devoured', 'voted', 'poisoned', 'heartbreak'];
+
+      playersToKill.forEach((player, index) => {
+        updates[`games/${currentGameCode}/players/${player.id}/isAlive`] = false;
+        updates[`games/${currentGameCode}/players/${player.id}/deathReason`] = deathReasons[index % deathReasons.length];
+        updates[`games/${currentGameCode}/players/${player.id}/deathNight`] = (index % nightsPlayed) + 1;
+      });
+
+      // Créer l'état de fin
+      updates[`games/${currentGameCode}/config/status`] = 'finished';
+      updates[`games/${currentGameCode}/gameState/currentPhase`] = 'finished';
+      updates[`games/${currentGameCode}/gameState/nightCount`] = nightsPlayed;
+      updates[`games/${currentGameCode}/gameState/endedAt`] = Date.now();
+      updates[`games/${currentGameCode}/result/winner`] = winner;
+      updates[`games/${currentGameCode}/result/message`] = winner === 'village'
+        ? 'Tous les loups ont été éliminés !'
+        : 'Les loups dominent le village !';
+
+      await update(ref(database), updates);
+      addLog(`Fin personnalisée: ${winner}, ${nightsPlayed} nuits`);
+
+      // Naviguer vers EndGame
+      const nav = getNavigation();
+      if (nav) {
+        setIsDevPanelVisible(false);
+        setTimeout(() => {
+          nav.replace('EndGame', { gameCode: currentGameCode, playerId: currentPlayerId });
+        }, 300);
+      }
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Ouvrir EndGameScreen directement (pour tester la vue)
+  const openEndGameScreen = () => {
+    const nav = getNavigation();
+    if (nav) {
+      setIsDevPanelVisible(false);
+      setTimeout(() => {
+        nav.navigate('EndGame', { gameCode: currentGameCode, playerId: currentPlayerId });
+      }, 300);
+    }
+  };
+
+  // Basculer vers vue MJ ou joueur pour tester EndGame
+  const testEndGameAsRole = (asMaster) => {
+    const targetPlayer = asMaster
+      ? players.find(p => p.isMaster)
+      : players.find(p => !p.isMaster);
+
+    if (!targetPlayer) {
+      Alert.alert('Erreur', asMaster ? 'Aucun MJ trouvé' : 'Aucun joueur trouvé');
+      return;
+    }
+
+    switchToPlayer(targetPlayer.id, targetPlayer.name);
+    openEndGameScreen();
   };
 
   // ==================== FONCTIONS RÔLES ====================
@@ -828,6 +1263,206 @@ export default function DevPanel() {
     </View>
   );
 
+  // Onglet Vote Test
+  const renderVoteTab = () => {
+    const alivePlayers = gamePlayers.filter(p => p.isAlive !== false);
+
+    return (
+      <View style={styles.tabContent}>
+        <ScrollView showsVerticalScrollIndicator={false}>
+          {/* Section : État actuel des votes */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>📊 État actuel des votes</Text>
+            <View style={styles.voteStatsCard}>
+              <View style={styles.voteStatRow}>
+                <Text style={styles.voteStatLabel}>Phase:</Text>
+                <Text style={[styles.voteStatValue, gameState?.currentPhase === 'day_vote' && { color: colors.primary }]}>
+                  {gameState?.currentPhase || '-'}
+                </Text>
+              </View>
+              <View style={styles.voteStatRow}>
+                <Text style={styles.voteStatLabel}>Votes enregistrés:</Text>
+                <Text style={styles.voteStatValue}>{voteStats.totalVotes} / {alivePlayers.length}</Text>
+              </View>
+              <View style={styles.voteStatRow}>
+                <Text style={styles.voteStatLabel}>Égalité:</Text>
+                <Text style={[styles.voteStatValue, voteStats.hasTie && { color: colors.warning }]}>
+                  {voteStats.hasTie ? `Oui (${voteStats.tiedPlayers.length} joueurs)` : 'Non'}
+                </Text>
+              </View>
+              {lovers && (
+                <View style={styles.voteStatRow}>
+                  <Text style={styles.voteStatLabel}>💕 Amoureux:</Text>
+                  <Text style={[styles.voteStatValue, { color: '#EC4899' }]}>
+                    {lovers.player1Name} + {lovers.player2Name}
+                  </Text>
+                </View>
+              )}
+            </View>
+          </View>
+
+          {/* Section : Actions phase vote */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>🗳️ Actions Vote</Text>
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.blueButton]}
+                onPress={simulateVotePhase}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Forcer Phase Vote</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.greenButton]}
+                onPress={fillRandomVotes}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Votes Aléatoires</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.yellowButton]}
+                onPress={createTieVotes}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Créer Égalité</Text>
+              </TouchableOpacity>
+            </View>
+            <TouchableOpacity
+              style={[styles.actionButton, styles.redButton, { marginTop: 8 }]}
+              onPress={handleClearVotes}
+            >
+              <Text style={styles.actionButtonText}>Effacer Votes</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Section : Amoureux */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>💕 Test Amoureux</Text>
+            <View style={styles.actionRow}>
+              {!lovers ? (
+                <TouchableOpacity
+                  style={[styles.actionButton, styles.pinkButton]}
+                  onPress={simulateLovers}
+                  disabled={isLoading}
+                >
+                  <Text style={styles.actionButtonText}>Créer Couple</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={[styles.actionButton, styles.redButton]}
+                  onPress={removeLovers}
+                >
+                  <Text style={styles.actionButtonText}>Supprimer Couple</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+            <Text style={styles.hintText}>
+              Testez la mort par chagrin en éliminant un amoureux
+            </Text>
+          </View>
+
+          {/* Section : Conditions de victoire */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>🏆 Test Victoire</Text>
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.blueButton]}
+                onPress={testVillageWins}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>🏘️ Village</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.redDarkButton]}
+                onPress={testWolvesWin}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>🐺 Loups</Text>
+              </TouchableOpacity>
+            </View>
+            <TouchableOpacity
+              style={[styles.actionButton, styles.greenButton, { marginTop: 8 }]}
+              onPress={reviveAllPlayers}
+              disabled={isLoading}
+            >
+              <Text style={styles.actionButtonText}>❤️ Ressusciter Tous</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Section : Test Écran de Fin */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>🎬 Test Écran de Fin</Text>
+            <Text style={styles.hintText}>
+              Simule une fin de partie et ouvre l'écran EndGame
+            </Text>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.blueButton]}
+                onPress={simulateVillageVictory}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>🏘️ Fin Village</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.redDarkButton]}
+                onPress={simulateWolvesVictory}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>🐺 Fin Loups</Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.endGameViewToggle}>
+              <Text style={styles.endGameViewLabel}>Tester la vue :</Text>
+              <View style={styles.actionRow}>
+                <TouchableOpacity
+                  style={[styles.actionButton, styles.yellowButton, { flex: 1 }]}
+                  onPress={() => testEndGameAsRole(true)}
+                >
+                  <Text style={styles.actionButtonText}>👑 MJ</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.actionButton, styles.grayButton, { flex: 1 }]}
+                  onPress={() => testEndGameAsRole(false)}
+                >
+                  <Text style={styles.actionButtonText}>👤 Joueur</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <TouchableOpacity
+              style={[styles.actionButton, styles.purpleButton, { marginTop: 8 }]}
+              onPress={openEndGameScreen}
+            >
+              <Text style={styles.actionButtonText}>👁️ Voir EndGame (sans simuler)</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Détail des votes actuels */}
+          {Object.keys(votes).length > 0 && (
+            <View style={styles.voteTestSection}>
+              <Text style={styles.sectionTitle}>📋 Détail des votes</Text>
+              {Object.entries(votes).map(([voterId, targetId]) => {
+                const voter = players.find(p => p.id === voterId);
+                const target = players.find(p => p.id === targetId);
+                return (
+                  <View key={voterId} style={styles.voteDetailRow}>
+                    <Text style={styles.voteDetailVoter}>{voter?.name || 'Inconnu'}</Text>
+                    <Text style={styles.voteDetailArrow}>→</Text>
+                    <Text style={styles.voteDetailTarget}>{target?.name || 'Inconnu'}</Text>
+                  </View>
+                );
+              })}
+            </View>
+          )}
+        </ScrollView>
+      </View>
+    );
+  };
+
   // Onglet Logs
   const renderLogsTab = () => (
     <View style={styles.tabContent}>
@@ -851,6 +1486,616 @@ export default function DevPanel() {
       </ScrollView>
     </View>
   );
+
+  // ==================== FONCTIONS TEST TIMER ====================
+
+  // Forcer une valeur de timer
+  const setTimerTest = async (seconds, duration = null, running = false) => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      const updates = {};
+      updates[`games/${currentGameCode}/gameState/timer`] = seconds;
+      updates[`games/${currentGameCode}/gameState/timerDuration`] = duration || seconds;
+      updates[`games/${currentGameCode}/gameState/timerRunning`] = running;
+
+      await update(ref(database), updates);
+      addLog(`Timer set: ${seconds}s (running: ${running})`);
+    } catch (error) {
+      addLog(`Erreur timer: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Demarrer le timer
+  const startTimerTest = async () => {
+    if (!currentGameCode || !gameState?.timer) return;
+
+    try {
+      await update(ref(database), {
+        [`games/${currentGameCode}/gameState/timerRunning`]: true,
+        [`games/${currentGameCode}/gameState/timerStartedAt`]: Date.now(),
+      });
+      addLog('Timer demarre');
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    }
+  };
+
+  // Arreter le timer
+  const stopTimerTest = async () => {
+    if (!currentGameCode) return;
+
+    try {
+      await update(ref(database), {
+        [`games/${currentGameCode}/gameState/timerRunning`]: false,
+      });
+      addLog('Timer arrete');
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    }
+  };
+
+  // Reset le timer
+  const resetTimerTest = async () => {
+    if (!currentGameCode) return;
+
+    const duration = gameState?.timerDuration || 60;
+    try {
+      await update(ref(database), {
+        [`games/${currentGameCode}/gameState/timer`]: duration,
+        [`games/${currentGameCode}/gameState/timerRunning`]: false,
+      });
+      addLog(`Timer reset a ${duration}s`);
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    }
+  };
+
+  // Naviguer vers GameMaster pour tester timer
+  const testTimerAsMJ = () => {
+    const mj = players.find(p => p.isMaster);
+    if (!mj) {
+      addLog('Erreur: Aucun MJ trouve');
+      return;
+    }
+
+    navigateAsPlayer(mj.id, 'GameMaster');
+    addLog('Navigation MJ pour test timer');
+  };
+
+  // Onglet Timer Test
+  const renderTimerTab = () => {
+    const timerValue = gameState?.timer;
+    const timerDuration = gameState?.timerDuration;
+    const timerRunning = gameState?.timerRunning;
+
+    const formatTime = (seconds) => {
+      if (seconds === null || seconds === undefined) return '--:--';
+      const mins = Math.floor(seconds / 60);
+      const secs = seconds % 60;
+      return `${mins}:${secs.toString().padStart(2, '0')}`;
+    };
+
+    // Couleur selon le temps
+    const getTimerColor = () => {
+      if (timerValue === null || timerValue === undefined) return '#666';
+      if (timerValue > 30) return '#10B981';
+      if (timerValue > 10) return '#F59E0B';
+      return '#EF4444';
+    };
+
+    return (
+      <View style={styles.tabContent}>
+        <ScrollView showsVerticalScrollIndicator={false}>
+          {/* Section : Etat actuel du timer */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Etat actuel du Timer</Text>
+            <View style={styles.voteStatsCard}>
+              <View style={[styles.timerDisplayLarge, { borderColor: getTimerColor() }]}>
+                <Text style={[styles.timerDisplayValue, { color: getTimerColor() }]}>
+                  {formatTime(timerValue)}
+                </Text>
+                <Text style={styles.timerDisplayLabel}>
+                  / {formatTime(timerDuration)}
+                </Text>
+              </View>
+              <View style={styles.voteStatRow}>
+                <Text style={styles.voteStatLabel}>Statut:</Text>
+                <Text style={[styles.voteStatValue, { color: timerRunning ? '#10B981' : '#F59E0B' }]}>
+                  {timerRunning ? ' En cours' : ' En pause'}
+                </Text>
+              </View>
+              <View style={styles.voteStatRow}>
+                <Text style={styles.voteStatLabel}>Couleur:</Text>
+                <View style={[styles.colorIndicator, { backgroundColor: getTimerColor() }]} />
+                <Text style={[styles.voteStatValue, { color: getTimerColor() }]}>
+                  {timerValue > 30 ? 'Vert' : timerValue > 10 ? 'Orange' : 'Rouge'}
+                </Text>
+              </View>
+            </View>
+          </View>
+
+          {/* Section : Controles rapides */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Controles Timer</Text>
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.greenButton]}
+                onPress={startTimerTest}
+                disabled={isLoading || !timerValue}
+              >
+                <Text style={styles.actionButtonText}> START</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.yellowButton]}
+                onPress={stopTimerTest}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}> PAUSE</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.blueButton]}
+                onPress={resetTimerTest}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}> RESET</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* Section : Tests rapides */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Tests rapides</Text>
+            <Text style={styles.hintText}>
+              Configure et lance des timers de test
+            </Text>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.redButton]}
+                onPress={() => setTimerTest(3, 3, true)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>3s (auto)</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.yellowButton]}
+                onPress={() => setTimerTest(10, 10, true)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>10s (auto)</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.greenButton]}
+                onPress={() => setTimerTest(30, 30, false)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>30s</Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.blueButton]}
+                onPress={() => setTimerTest(60, 60, false)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>1min</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.purpleButton]}
+                onPress={() => setTimerTest(120, 120, false)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>2min</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.grayButton]}
+                onPress={() => setTimerTest(0, 60, false)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Forcer 0</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* Section : Tests couleurs */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Tests Couleurs</Text>
+            <Text style={styles.hintText}>
+              Testez les differentes couleurs du timer
+            </Text>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, { backgroundColor: '#10B981' }]}
+                onPress={() => setTimerTest(45, 60, false)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Vert (&gt;30s)</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, { backgroundColor: '#F59E0B' }]}
+                onPress={() => setTimerTest(20, 60, false)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Orange (10-30s)</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, { backgroundColor: '#EF4444' }]}
+                onPress={() => setTimerTest(5, 60, true)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Rouge (&lt;10s)</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* Section : Navigation test */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Vues Timer</Text>
+            <Text style={styles.hintText}>
+              Ouvrez les differentes vues pour tester le timer
+            </Text>
+
+            <TouchableOpacity
+              style={[styles.actionButton, styles.purpleButton, { marginBottom: 10 }]}
+              onPress={testTimerAsMJ}
+            >
+              <Text style={styles.actionButtonText}>Ouvrir vue MJ (controles)</Text>
+            </TouchableOpacity>
+
+            {gamePlayers.length > 0 && (
+              <TouchableOpacity
+                style={[styles.actionButton, styles.blueButton]}
+                onPress={() => {
+                  const firstPlayer = gamePlayers[0];
+                  if (firstPlayer) {
+                    navigateAsPlayer(firstPlayer.id, 'PlayerGame');
+                    addLog('Navigation joueur pour test timer');
+                  }
+                }}
+              >
+                <Text style={styles.actionButtonText}>Ouvrir vue Joueur (lecture seule)</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          {/* Section : Infos */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Notes</Text>
+            <View style={styles.infoBox}>
+              <Text style={styles.infoText}>
+                 Le MJ controle le timer (start/pause/reset)
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                 Les joueurs voient le timer en lecture seule
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                 Couleur: Vert &gt; 30s, Orange 10-30s, Rouge &lt; 10s
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                 Vibration + clignotement sous 10s
+              </Text>
+            </View>
+          </View>
+        </ScrollView>
+      </View>
+    );
+  };
+
+  // ==================== FONCTIONS TEST UX ====================
+
+  // Simuler une erreur reseau
+  const simulateNetworkError = () => {
+    Alert.alert(
+      '📡 Erreur de connexion',
+      'Verifiez votre connexion Internet et reessayez.',
+      [
+        { text: 'Reessayer', onPress: () => addLog('Retry simule') },
+        { text: 'Fermer', style: 'cancel' }
+      ]
+    );
+    addLog('Erreur reseau simulee');
+  };
+
+  // Simuler code invalide
+  const simulateInvalidCode = () => {
+    Alert.alert(
+      '❌ Code invalide',
+      'Ce code de partie n\'existe pas. Verifiez-le et reessayez.',
+      [{ text: 'OK' }]
+    );
+    addLog('Code invalide simule');
+  };
+
+  // Simuler partie pleine
+  const simulateGameFull = () => {
+    Alert.alert(
+      '🚫 Partie complete',
+      'Cette partie a atteint le nombre maximum de joueurs (15).',
+      [{ text: 'OK' }]
+    );
+    addLog('Partie pleine simulee');
+  };
+
+  // Simuler partie deja lancee
+  const simulateGameStarted = () => {
+    Alert.alert(
+      '🎮 Partie en cours',
+      'Cette partie a deja commence. Vous ne pouvez plus la rejoindre.',
+      [{ text: 'OK' }]
+    );
+    addLog('Partie lancee simulee');
+  };
+
+  // Simuler acces refuse
+  const simulateAccessDenied = () => {
+    Alert.alert(
+      '🔒 Acces refuse',
+      'Cette zone est reservee au Maitre du Jeu.',
+      [{ text: 'OK' }]
+    );
+    addLog('Acces refuse simule');
+  };
+
+  // Tester toutes les confirmations
+  const testAllConfirmations = async () => {
+    const confirmations = [
+      { title: '🚪 Quitter la partie ?', message: 'Etes-vous sur de vouloir quitter ?' },
+      { title: '🏁 Terminer la partie ?', message: 'Tous les joueurs seront deconnectes.' },
+      { title: '⏱️ Timer en cours', message: 'Forcer le passage a la phase suivante ?' },
+      { title: '🗳️ Confirmer votre vote', message: 'Voter pour Jean ?' },
+      { title: '💀 Eliminer ce joueur ?', message: 'Eliminer Marie ?' },
+    ];
+
+    for (const conf of confirmations) {
+      await new Promise(resolve => {
+        Alert.alert(
+          conf.title,
+          conf.message,
+          [
+            { text: 'Annuler', style: 'cancel', onPress: resolve },
+            { text: 'Confirmer', onPress: resolve }
+          ]
+        );
+      });
+      await new Promise(r => setTimeout(r, 500));
+    }
+    addLog('Toutes les confirmations testees');
+  };
+
+  // Test loading avec duree
+  const testLoadingState = (label, duration = 2000) => {
+    setIsLoading(true);
+    addLog(`Loading: ${label} (${duration}ms)`);
+    setTimeout(() => {
+      setIsLoading(false);
+      addLog(`Loading termine: ${label}`);
+    }, duration);
+  };
+
+  // Ajouter 15 joueurs bots
+  const addMaxPlayers = async () => {
+    if (!currentGameCode) return;
+
+    setIsLoading(true);
+    try {
+      const updates = {};
+      const botNames = ['Alice', 'Bob', 'Charlie', 'Diana', 'Eve', 'Frank', 'Grace', 'Henry', 'Ivy', 'Jack', 'Kate', 'Leo', 'Mia', 'Noah', 'Olivia'];
+
+      for (let i = 0; i < 15; i++) {
+        const botId = `bot_${Date.now()}_${i}`;
+        updates[`games/${currentGameCode}/players/${botId}`] = {
+          name: botNames[i],
+          isBot: true,
+          isAlive: true,
+          isMaster: false,
+          joinedAt: Date.now() + i,
+        };
+      }
+
+      await update(ref(database), updates);
+      addLog('15 joueurs ajoutes pour test perf');
+    } catch (error) {
+      addLog(`Erreur: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Ajouter 100 logs
+  const addManyLogs = () => {
+    for (let i = 0; i < 100; i++) {
+      addLog(`Test log #${i + 1} - ${Date.now()}`);
+    }
+    addLog('100 logs ajoutes pour test scroll');
+  };
+
+  // Onglet UX Test
+  const renderUXTab = () => {
+    return (
+      <View style={styles.tabContent}>
+        <ScrollView showsVerticalScrollIndicator={false}>
+          {/* Section : Tests erreurs */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Tests Erreurs</Text>
+            <Text style={styles.hintText}>
+              Simule differentes erreurs pour tester les messages
+            </Text>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.redButton]}
+                onPress={simulateNetworkError}
+              >
+                <Text style={styles.actionButtonText}>Erreur reseau</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.redButton]}
+                onPress={simulateInvalidCode}
+              >
+                <Text style={styles.actionButtonText}>Code invalide</Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.yellowButton]}
+                onPress={simulateGameFull}
+              >
+                <Text style={styles.actionButtonText}>Partie pleine</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.yellowButton]}
+                onPress={simulateGameStarted}
+              >
+                <Text style={styles.actionButtonText}>Partie lancee</Text>
+              </TouchableOpacity>
+            </View>
+
+            <TouchableOpacity
+              style={[styles.actionButton, styles.purpleButton, { marginTop: 8 }]}
+              onPress={simulateAccessDenied}
+            >
+              <Text style={styles.actionButtonText}>Acces refuse (MJ)</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Section : Tests confirmations */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Tests Confirmations</Text>
+            <Text style={styles.hintText}>
+              Teste toutes les boites de dialogue de confirmation
+            </Text>
+
+            <TouchableOpacity
+              style={[styles.actionButton, styles.blueButton]}
+              onPress={testAllConfirmations}
+            >
+              <Text style={styles.actionButtonText}>Tester toutes les confirmations</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Section : Tests loading */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Tests Loading States</Text>
+            <Text style={styles.hintText}>
+              Teste les differents etats de chargement
+            </Text>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.grayButton]}
+                onPress={() => testLoadingState('Creation partie', 2000)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>2s</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.grayButton]}
+                onPress={() => testLoadingState('Connexion', 4000)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>4s</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.grayButton]}
+                onPress={() => testLoadingState('Distribution roles', 6000)}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>6s</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* Section : Tests performance */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Tests Performance</Text>
+            <Text style={styles.hintText}>
+              Teste les performances avec beaucoup de donnees
+            </Text>
+
+            <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.greenButton]}
+                onPress={addMaxPlayers}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>+15 joueurs</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.redButton]}
+                onPress={removeAllBots}
+                disabled={isLoading}
+              >
+                <Text style={styles.actionButtonText}>Suppr bots</Text>
+              </TouchableOpacity>
+            </View>
+
+            <TouchableOpacity
+              style={[styles.actionButton, styles.yellowButton, { marginTop: 8 }]}
+              onPress={addManyLogs}
+            >
+              <Text style={styles.actionButtonText}>+100 logs (test scroll)</Text>
+            </TouchableOpacity>
+
+            <View style={styles.perfStats}>
+              <Text style={styles.perfStatText}>
+                Joueurs: {players.length} | Bots: {players.filter(p => p.isBot).length}
+              </Text>
+              <Text style={styles.perfStatText}>
+                Logs: {eventLogs.length}
+              </Text>
+            </View>
+          </View>
+
+          {/* Section : Skip animations */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Options Dev</Text>
+
+            <View style={styles.switchRow}>
+              <Text style={styles.switchLabel}>Skip animations (test rapide)</Text>
+              <Switch
+                value={skipAnimationEnabled}
+                onValueChange={toggleSkipAnimation}
+                trackColor={{ false: '#333', true: colors.success }}
+                thumbColor={skipAnimationEnabled ? '#FFF' : '#888'}
+              />
+            </View>
+          </View>
+
+          {/* Section : Infos UX */}
+          <View style={styles.voteTestSection}>
+            <Text style={styles.sectionTitle}>Guide UX</Text>
+            <View style={styles.infoBox}>
+              <Text style={styles.infoText}>
+                Composants disponibles:
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                - Loading.js : spinner, dots, pulse, skeleton
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                - ErrorMessage.js : card, banner, toast
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                - ConfirmModal.js : modals de confirmation
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                - FeedbackToast.js : success/error toasts
+              </Text>
+              <Text style={styles.infoTextSmall}>
+                - AnimatedCard.js : animations stagger, flip, pulse
+              </Text>
+            </View>
+          </View>
+        </ScrollView>
+      </View>
+    );
+  };
 
   if (!__DEV__) return null;
 
@@ -894,11 +2139,14 @@ export default function DevPanel() {
               </View>
             )}
 
-            {/* Tabs - 5 onglets */}
+            {/* Tabs - 8 onglets */}
             <View style={styles.tabs}>
               {[
                 { key: 'players', label: 'Joueurs' },
-                { key: 'roles', label: 'Rôles' },
+                { key: 'roles', label: 'Roles' },
+                { key: 'vote', label: 'Vote' },
+                { key: 'timer', label: 'Timer' },
+                { key: 'ux', label: 'UX' },
                 { key: 'test', label: 'Test' },
                 { key: 'debug', label: 'Debug' },
                 { key: 'logs', label: 'Logs' },
@@ -921,6 +2169,9 @@ export default function DevPanel() {
             )}
             {activeTab === 'players' && renderPlayersTab()}
             {activeTab === 'roles' && renderRolesTab()}
+            {activeTab === 'vote' && renderVoteTab()}
+            {activeTab === 'timer' && renderTimerTab()}
+            {activeTab === 'ux' && renderUXTab()}
             {activeTab === 'test' && renderTestTab()}
             {activeTab === 'debug' && renderDebugTab()}
             {activeTab === 'logs' && renderLogsTab()}
@@ -1470,5 +2721,137 @@ const styles = StyleSheet.create({
     color: '#FFF',
     fontSize: 12,
     flex: 1,
+  },
+
+  // Vote Tab styles
+  voteTestSection: {
+    backgroundColor: '#252525',
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 15,
+  },
+  voteStatsCard: {
+    backgroundColor: '#1A1A1A',
+    borderRadius: 8,
+    padding: 10,
+  },
+  voteStatRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 5,
+  },
+  voteStatLabel: {
+    color: '#888',
+    fontSize: 13,
+  },
+  voteStatValue: {
+    color: '#FFF',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  hintText: {
+    color: '#666',
+    fontSize: 11,
+    fontStyle: 'italic',
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  yellowButton: {
+    backgroundColor: '#F59E0B',
+  },
+  pinkButton: {
+    backgroundColor: '#EC4899',
+  },
+  redDarkButton: {
+    backgroundColor: '#8B0000',
+  },
+  voteDetailRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: '#333',
+  },
+  voteDetailVoter: {
+    color: '#FFF',
+    fontSize: 13,
+    flex: 1,
+  },
+  voteDetailArrow: {
+    color: '#888',
+    fontSize: 16,
+    marginHorizontal: 10,
+  },
+  voteDetailTarget: {
+    color: colors.primary,
+    fontSize: 13,
+    fontWeight: '600',
+    flex: 1,
+    textAlign: 'right',
+  },
+
+  // End Game Test styles
+  endGameViewToggle: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#333',
+  },
+  endGameViewLabel: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+
+  // Timer Tab styles
+  timerDisplayLarge: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+    borderWidth: 3,
+    borderRadius: 16,
+    marginBottom: 15,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+  },
+  timerDisplayValue: {
+    fontSize: 42,
+    fontWeight: 'bold',
+    fontVariant: ['tabular-nums'],
+  },
+  timerDisplayLabel: {
+    color: '#888',
+    fontSize: 14,
+    marginTop: 4,
+  },
+  colorIndicator: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    marginRight: 8,
+  },
+
+  // UX Tab styles
+  perfStats: {
+    marginTop: 12,
+    padding: 10,
+    backgroundColor: '#1A1A1A',
+    borderRadius: 8,
+  },
+  perfStatText: {
+    color: '#888',
+    fontSize: 12,
+    fontVariant: ['tabular-nums'],
+  },
+  switchRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  switchLabel: {
+    color: colors.textPrimary,
+    fontSize: 14,
+    flex: 1,
+    marginRight: 10,
   },
 });

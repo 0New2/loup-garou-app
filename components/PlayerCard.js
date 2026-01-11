@@ -1,62 +1,215 @@
-import React from 'react';
+import React, { memo, useRef, useEffect } from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
   StyleSheet,
+  Animated,
+  Easing,
 } from 'react-native';
 import { getRoleById } from '../utils/roles';
 import colors from '../constants/colors';
 
 // Raisons de mort
 const DEATH_REASONS = {
-  werewolves: { label: 'Dévoré', icon: '🐺' },
+  werewolves: { label: 'Devore', icon: '🐺' },
   vote: { label: 'Pendu', icon: '⚖️' },
-  witch_poison: { label: 'Empoisonné', icon: '🧪' },
+  witch_poison: { label: 'Empoisonne', icon: '🧪' },
   hunter: { label: 'Abattu', icon: '🔫' },
   lovers: { label: 'Chagrin', icon: '💔' },
   unknown: { label: 'Mort', icon: '💀' },
 };
 
-export default function PlayerCard({
+/**
+ * Carte joueur optimisee avec React.memo et animations
+ */
+const PlayerCard = memo(({
   player,
   onAddBonusRole,
   onToggleAlive,
   onViewRole,
+  onSelect,
   showActions = true,
   compact = false,
-}) {
+  isSelected = false,
+  index = 0,
+  animated = true,
+}) => {
   const role = getRoleById(player.role);
   const bonusRole = player.bonusRole ? getRoleById(player.bonusRole) : null;
   const isAlive = player.isAlive !== false;
   const deathReason = DEATH_REASONS[player.deathReason] || DEATH_REASONS.unknown;
 
+  // Animations
+  const fadeAnim = useRef(new Animated.Value(animated ? 0 : 1)).current;
+  const slideAnim = useRef(new Animated.Value(animated ? 30 : 0)).current;
+  const scaleAnim = useRef(new Animated.Value(1)).current;
+  const shakeAnim = useRef(new Animated.Value(0)).current;
+  const eliminateAnim = useRef(new Animated.Value(isAlive ? 1 : 0.6)).current;
+  const wasAlive = useRef(isAlive);
+
+  // Animation d'entree (stagger)
+  useEffect(() => {
+    if (animated) {
+      const delay = index * 50;
+      Animated.parallel([
+        Animated.timing(fadeAnim, {
+          toValue: 1,
+          duration: 300,
+          delay,
+          useNativeDriver: true,
+        }),
+        Animated.spring(slideAnim, {
+          toValue: 0,
+          tension: 50,
+          friction: 8,
+          delay,
+          useNativeDriver: true,
+        }),
+      ]).start();
+    }
+  }, [animated, index]);
+
+  // Animation d'elimination
+  useEffect(() => {
+    if (wasAlive.current && !isAlive) {
+      // Shake puis fade
+      Animated.sequence([
+        Animated.sequence([
+          Animated.timing(shakeAnim, { toValue: 10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnim, { toValue: -10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnim, { toValue: 10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnim, { toValue: -10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true }),
+        ]),
+        Animated.timing(eliminateAnim, {
+          toValue: 0.6,
+          duration: 300,
+          easing: Easing.out(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ]).start();
+    } else if (!wasAlive.current && isAlive) {
+      // Resurrection
+      Animated.timing(eliminateAnim, {
+        toValue: 1,
+        duration: 300,
+        useNativeDriver: true,
+      }).start();
+    }
+    wasAlive.current = isAlive;
+  }, [isAlive]);
+
+  // Animation de selection
+  useEffect(() => {
+    Animated.spring(scaleAnim, {
+      toValue: isSelected ? 1.02 : 1,
+      tension: 100,
+      friction: 8,
+      useNativeDriver: true,
+    }).start();
+  }, [isSelected]);
+
+  // Feedback tactile pour boutons
+  const handlePressIn = () => {
+    Animated.spring(scaleAnim, {
+      toValue: 0.98,
+      tension: 100,
+      friction: 5,
+      useNativeDriver: true,
+    }).start();
+  };
+
+  const handlePressOut = () => {
+    Animated.spring(scaleAnim, {
+      toValue: isSelected ? 1.02 : 1,
+      tension: 100,
+      friction: 5,
+      useNativeDriver: true,
+    }).start();
+  };
+
+  // Version compacte
   if (compact) {
     return (
-      <View style={[styles.compactCard, !isAlive && styles.cardDead]}>
-        <View style={[styles.compactIcon, { backgroundColor: role?.color || '#333' }]}>
-          <Text style={styles.compactIconText}>{role?.icon || '❓'}</Text>
-        </View>
-        <View style={styles.compactInfo}>
-          <Text style={[styles.compactName, !isAlive && styles.nameDead]}>
-            {player.name}
-          </Text>
-          <Text style={[styles.compactRole, { color: role?.color || '#888' }]}>
-            {role?.name || 'Sans rôle'}
-          </Text>
-        </View>
-        {!isAlive && (
-          <Text style={styles.deadBadgeCompact}>{deathReason.icon}</Text>
-        )}
-      </View>
+      <Animated.View
+        style={[
+          styles.compactCard,
+          !isAlive && styles.cardDead,
+          isSelected && styles.cardSelected,
+          {
+            opacity: Animated.multiply(fadeAnim, eliminateAnim),
+            transform: [
+              { translateY: slideAnim },
+              { translateX: shakeAnim },
+              { scale: scaleAnim },
+            ],
+          },
+        ]}
+      >
+        <TouchableOpacity
+          style={styles.compactTouchable}
+          onPress={() => onSelect?.(player)}
+          onPressIn={handlePressIn}
+          onPressOut={handlePressOut}
+          disabled={!onSelect}
+          activeOpacity={0.8}
+          accessibilityLabel={`Joueur ${player.name}, ${role?.name || 'sans role'}, ${isAlive ? 'vivant' : 'elimine'}`}
+          accessibilityRole="button"
+        >
+          <View style={[styles.compactIcon, { backgroundColor: role?.color || '#333' }]}>
+            <Text style={styles.compactIconText}>{role?.icon || '❓'}</Text>
+          </View>
+          <View style={styles.compactInfo}>
+            <Text style={[styles.compactName, !isAlive && styles.nameDead]} numberOfLines={1}>
+              {player.name}
+            </Text>
+            <Text style={[styles.compactRole, { color: role?.color || '#888' }]} numberOfLines={1}>
+              {role?.name || 'Sans role'}
+            </Text>
+          </View>
+          {!isAlive && (
+            <Text style={styles.deadBadgeCompact}>{deathReason.icon}</Text>
+          )}
+          {isSelected && (
+            <View style={styles.selectedIndicator}>
+              <Text style={styles.selectedIndicatorText}>✓</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+      </Animated.View>
     );
   }
 
+  // Version complete
   return (
-    <View style={[styles.card, !isAlive && styles.cardDead]}>
-      {/* En-tête avec icône et info */}
-      <View style={styles.cardHeader}>
-        {/* Icône du rôle */}
+    <Animated.View
+      style={[
+        styles.card,
+        !isAlive && styles.cardDead,
+        isSelected && styles.cardSelected,
+        {
+          opacity: Animated.multiply(fadeAnim, eliminateAnim),
+          transform: [
+            { translateY: slideAnim },
+            { translateX: shakeAnim },
+            { scale: scaleAnim },
+          ],
+        },
+      ]}
+    >
+      {/* En-tete avec icone et info */}
+      <TouchableOpacity
+        style={styles.cardHeader}
+        onPress={() => onSelect?.(player)}
+        onPressIn={handlePressIn}
+        onPressOut={handlePressOut}
+        disabled={!onSelect}
+        activeOpacity={0.8}
+        accessibilityLabel={`Joueur ${player.name}, ${role?.name || 'sans role'}, equipe ${role?.team || 'inconnue'}, ${isAlive ? 'vivant' : 'elimine'}`}
+        accessibilityRole="button"
+      >
+        {/* Icone du role */}
         <View style={[styles.roleIconContainer, { backgroundColor: role?.color || '#333' }]}>
           <Text style={styles.roleIcon}>{role?.icon || '❓'}</Text>
         </View>
@@ -64,15 +217,15 @@ export default function PlayerCard({
         {/* Informations du joueur */}
         <View style={styles.playerInfo}>
           <View style={styles.nameRow}>
-            <Text style={[styles.playerName, !isAlive && styles.nameDead]}>
+            <Text style={[styles.playerName, !isAlive && styles.nameDead]} numberOfLines={1}>
               {player.name}
             </Text>
             {player.isBot && <Text style={styles.botBadge}>🤖</Text>}
           </View>
 
           <View style={styles.roleRow}>
-            <Text style={[styles.roleName, { color: role?.color || '#888' }]}>
-              {role?.name || 'Sans rôle'}
+            <Text style={[styles.roleName, { color: role?.color || '#888' }]} numberOfLines={1}>
+              {role?.name || 'Sans role'}
             </Text>
             {role && (
               <View style={[styles.teamBadge, { backgroundColor: role.team === 'loups' ? '#8B0000' : '#1E3A8A' }]}>
@@ -83,7 +236,7 @@ export default function PlayerCard({
             )}
           </View>
 
-          {/* Rôle bonus si présent */}
+          {/* Role bonus si present */}
           {bonusRole && (
             <View style={styles.bonusRow}>
               <Text style={styles.bonusLabel}>Bonus:</Text>
@@ -107,26 +260,35 @@ export default function PlayerCard({
             </View>
           )}
         </View>
-      </View>
+      </TouchableOpacity>
 
-      {/* Actions (si activées) */}
+      {/* Indicateur de selection */}
+      {isSelected && (
+        <View style={styles.selectedBorder} />
+      )}
+
+      {/* Actions (si activees) */}
       {showActions && (
         <View style={styles.actionsRow}>
-          {/* Voir le rôle */}
+          {/* Voir le role */}
           {onViewRole && (
             <TouchableOpacity
               style={[styles.actionButton, styles.viewButton]}
               onPress={() => onViewRole(player)}
+              accessibilityLabel={`Voir le role de ${player.name}`}
+              accessibilityRole="button"
             >
               <Text style={styles.actionButtonText}>👁️ Voir</Text>
             </TouchableOpacity>
           )}
 
-          {/* Ajouter rôle bonus */}
+          {/* Ajouter role bonus */}
           {onAddBonusRole && isAlive && (
             <TouchableOpacity
               style={[styles.actionButton, styles.bonusButton]}
               onPress={() => onAddBonusRole(player)}
+              accessibilityLabel={`Ajouter un role bonus a ${player.name}`}
+              accessibilityRole="button"
             >
               <Text style={styles.actionButtonText}>+ Bonus</Text>
             </TouchableOpacity>
@@ -137,17 +299,37 @@ export default function PlayerCard({
             <TouchableOpacity
               style={[styles.actionButton, isAlive ? styles.killButton : styles.reviveButton]}
               onPress={() => onToggleAlive(player)}
+              accessibilityLabel={isAlive ? `Eliminer ${player.name}` : `Ressusciter ${player.name}`}
+              accessibilityRole="button"
             >
               <Text style={styles.actionButtonText}>
-                {isAlive ? '☠️ Éliminer' : '❤️ Ressusciter'}
+                {isAlive ? '☠️ Eliminer' : '❤️ Ressusciter'}
               </Text>
             </TouchableOpacity>
           )}
         </View>
       )}
-    </View>
+    </Animated.View>
   );
-}
+}, (prevProps, nextProps) => {
+  // Comparaison personnalisee pour React.memo
+  return (
+    prevProps.player.id === nextProps.player.id &&
+    prevProps.player.name === nextProps.player.name &&
+    prevProps.player.role === nextProps.player.role &&
+    prevProps.player.isAlive === nextProps.player.isAlive &&
+    prevProps.player.bonusRole === nextProps.player.bonusRole &&
+    prevProps.player.deathReason === nextProps.player.deathReason &&
+    prevProps.isSelected === nextProps.isSelected &&
+    prevProps.showActions === nextProps.showActions &&
+    prevProps.compact === nextProps.compact &&
+    prevProps.index === nextProps.index
+  );
+});
+
+PlayerCard.displayName = 'PlayerCard';
+
+export default PlayerCard;
 
 const styles = StyleSheet.create({
   // ==================== CARTE STANDARD ====================
@@ -158,11 +340,27 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     borderLeftWidth: 4,
     borderLeftColor: colors.primary,
+    overflow: 'hidden',
   },
   cardDead: {
-    opacity: 0.6,
     borderLeftColor: colors.dead,
     backgroundColor: colors.backgroundSecondary,
+  },
+  cardSelected: {
+    borderLeftColor: colors.success,
+    borderColor: colors.success,
+    borderWidth: 2,
+  },
+  selectedBorder: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 16,
+    borderWidth: 2,
+    borderColor: colors.success,
+    pointerEvents: 'none',
   },
   cardHeader: {
     flexDirection: 'row',
@@ -191,6 +389,7 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
     color: colors.textPrimary,
+    flex: 1,
   },
   nameDead: {
     textDecorationLine: 'line-through',
@@ -204,6 +403,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+    flexWrap: 'wrap',
   },
   roleName: {
     fontSize: 14,
@@ -281,6 +481,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderRadius: 8,
     alignItems: 'center',
+    minHeight: 44, // Accessibilite: taille minimum
   },
   actionButtonText: {
     color: '#FFF',
@@ -302,12 +503,16 @@ const styles = StyleSheet.create({
 
   // ==================== CARTE COMPACTE ====================
   compactCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
     backgroundColor: colors.backgroundCard,
     borderRadius: 10,
-    padding: 10,
     marginBottom: 6,
+    overflow: 'hidden',
+  },
+  compactTouchable: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 10,
+    minHeight: 44, // Accessibilite
   },
   compactIcon: {
     width: 36,
@@ -334,5 +539,19 @@ const styles = StyleSheet.create({
   },
   deadBadgeCompact: {
     fontSize: 16,
+  },
+  selectedIndicator: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: colors.success,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginLeft: 8,
+  },
+  selectedIndicatorText: {
+    color: '#FFF',
+    fontSize: 14,
+    fontWeight: 'bold',
   },
 });
